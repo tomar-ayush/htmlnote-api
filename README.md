@@ -1,6 +1,5 @@
 # HTMLNote API
 
-[![CI/CD](https://github.com/tomar-ayush/htmlnote-api/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/tomar-ayush/htmlnote-api/actions/workflows/ci-cd.yml)
 ![Python 3.13](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.163-009688?logo=fastapi&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Neon-4169E1?logo=postgresql&logoColor=white)
@@ -46,7 +45,7 @@ flowchart LR
 - **Universal S3 Compatibility (`app/store.py`)**: Configured with `signature_version="s3v4"`, `request_checksum_calculation="when_required"`, and `response_checksum_validation="when_required"` so `PutObject`, `CopyObject`, and `DeleteObjects` work seamlessly across AWS S3, Cloudflare R2, and Backblaze B2 without checksum header rejections.
 - **Encrypted Credentials at Rest (`app/storage.py`)**: Per-tenant `secret_key_enc` is encrypted with Fernet (`cryptography`) derived from `SECRET_KEY` before saving to Postgres and is never returned in API responses.
 - **SSRF Protection (`validate_endpoint`)**: Blocks plain HTTP (unless `ALLOW_INSECURE_S3=true`), embedded credentials, query/path injection, and any resolved loopback, RFC1918 private, link-local (`169.254.169.254`), or non-global IP addresses.
-- **Authentication & CSRF (`app/auth.py`)**: `scrypt` password hashing, timing-safe token verification, login brute-force throttling, `__Host-hn_session` `HttpOnly` cookies, double-submit `__Host-hn_csrf` + `X-CSRF-Token` validation, and `ALLOWED_ORIGINS` verification for Vercel Edge Rewrites.
+- **Authentication & CSRF (`app/auth.py`)**: `scrypt` password hashing, timing-safe token verification, login brute-force throttling, `__Host-hn_session` `HttpOnly` cookies, double-submit `__Host-hn_csrf` + `X-CSRF-Token` validation, and `ALLOWED_ORIGINS` pattern matching (`fnmatchcase`) for Vercel Edge Rewrites.
 - **Dual Content-Security-Policy Sandboxing (`app/main.py`)**:
   - Edit mode (`/page/{path}`): `script-src 'none'; object-src 'none'; base-uri 'none'`
   - Preview mode (`/view/{path}`): `sandbox allow-scripts allow-popups allow-modals`
@@ -124,34 +123,21 @@ python -m unittest discover -s tests -v
 
 ## Deploying to Google Cloud Run + Neon
 
-### 1. Environment Variables
+### 1. Connect GitHub via GCP Cloud Build
+
+1. In Google Cloud Console, open **Cloud Run -> Create Service -> Continuously deploy from a repository (Cloud Build)**.
+2. Connect **`tomar-ayush/htmlnote-api`**, branch `^main$`, and build type **Dockerfile** (`/Dockerfile`).
+3. Allow unauthenticated invocations (authentication is enforced per route by session cookies).
+
+### 2. Environment Variables & Secrets in Cloud Run
+
+Configure these 3 variables directly in Cloud Run (**Variables & Secrets**):
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `DATABASE_URL` | Yes | — | Neon Postgres URL (`postgresql://...` and `postgres://...` are automatically normalized to `postgresql+psycopg://`) |
-| `SECRET_KEY` | Yes | — | Random secret used to Fernet-encrypt per-user S3 secret keys (`openssl rand -hex 32`) |
-| `ALLOWED_ORIGINS` | Yes (with Vercel) | `""` | Comma-separated Vercel origins allowed to send unsafe requests (e.g. `https://htmlnote-web.vercel.app`) |
-| `COOKIE_SECURE` | Production | `true` | Enables `__Host-` cookie prefix and `Secure` attribute |
-| `ALLOWED_HOSTS` | Optional | `*` in `Dockerfile` | Comma-separated allowed `Host` headers |
-| `ALLOW_INSECURE_S3` | Optional | `false` | Set `true` only if connecting to self-hosted HTTP S3 in local/private dev |
-
-### 2. Automated GitHub Actions Pipeline (`.github/workflows/ci-cd.yml`)
-
-Every push or PR runs `python -m unittest discover -s tests -v` and verifies the Docker image build. Pushes to `main` automatically build, push to Artifact Registry, and deploy to Cloud Run once GCP credentials are added.
-
-Configure your repository secrets and variables under **Settings -> Secrets and variables -> Actions**:
-
-#### Option A — Workload Identity Federation (Recommended, Keyless OIDC)
-- **Secrets**: `DATABASE_URL`, `SECRET_KEY`
-- **Variables or Secrets**: `GCP_PROJECT_ID`, `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_SERVICE_ACCOUNT`, `ALLOWED_ORIGINS`
-
-#### Option B — Service Account JSON Key
-- **Secrets**: `DATABASE_URL`, `SECRET_KEY`, `GCP_PROJECT_ID`, `GCP_SA_KEY`
-- **Variables or Secrets**: `ALLOWED_ORIGINS`
-
-Optional GitHub Actions **Variables**:
-- `GCP_REGION` (default: `us-central1`)
-- `GCP_ARTIFACT_REPO` (default: `htmlnote`)
-- `CLOUD_RUN_SERVICE` (default: `htmlnote-api`)
-
-> **Note:** Enable the Cloud Run Admin (`run.googleapis.com`), Artifact Registry (`artifactregistry.googleapis.com`), and IAM Credentials APIs in your GCP project, and grant the deploy service account `roles/run.admin`, `roles/artifactregistry.writer`, and `roles/iam.serviceAccountUser`.
+| `DATABASE_URL` | Yes | — | Neon Postgres connection string (`postgresql://...` and `postgres://...` are normalized automatically to `postgresql+psycopg://`) |
+| `SECRET_KEY` | Yes | — | Random secret used to Fernet-encrypt per-user S3 secret keys in Neon (`openssl rand -hex 32`) |
+| `ALLOWED_ORIGINS` | Yes (with Vercel) | `""` | Comma-separated Vercel origins or wildcard patterns allowed to send proxied write requests (e.g. `https://htmlnote-web.vercel.app,https://htmlnote-web-*.vercel.app`) |
+| `COOKIE_SECURE` | Production | `true` (in `Dockerfile`) | Enables `__Host-` cookie prefix and `Secure` attribute |
+| `ALLOWED_HOSTS` | Optional | `*` (in `Dockerfile`) | Comma-separated allowed `Host` headers |
+| `ALLOW_INSECURE_S3` | Optional | `false` | Set `true` only for plain-HTTP local/private S3 servers |

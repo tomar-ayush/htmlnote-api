@@ -1,3 +1,4 @@
+from fnmatch import fnmatchcase
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -33,7 +34,7 @@ def origin_allowed(origin: str, host: str | None) -> bool:
     netloc = urlsplit(norm).netloc
     if host and netloc == host.lower():
         return True
-    return norm in ALLOWED_ORIGINS or netloc in ALLOWED_ORIGINS
+    return any(fnmatchcase(norm, pat) or fnmatchcase(netloc, pat) for pat in ALLOWED_ORIGINS)
 
 
 @app.middleware("http")
