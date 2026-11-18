@@ -98,7 +98,10 @@ External agents or automation scripts only need to upload `[S3_PREFIX/]<notebook
 | `GET` | `/api/share?path=...` | Get public share link status for a page |
 | `POST` | `/api/share` | Create or update public share link with optional expiry |
 | `DELETE` | `/api/share?path=...` | Revoke public share link for a page |
-| `POST` | `/api/share/presign` | Generate direct S3/R2 presigned GET URL (`1h–7d`) |
+| `GET` | `/api/drive/auth-url` | Generate Google OAuth URL for connecting Google Drive |
+| `GET` | `/api/drive/callback` | Handle Google OAuth callback and provision `HTML Notebook` Drive folder |
+| `POST` | `/api/drive/provider` | Switch active storage backend between `gdrive` and `s3` |
+| `DELETE` | `/api/drive` | Disconnect Google Drive integration |
 | `GET` | `/page/{path}` | Serve raw HTML with script-disabled edit CSP |
 | `GET` | `/view/{path}` | Serve HTML inside sandboxed view CSP |
 | `GET` | `/s/{token}` | Serve publicly shared page read-only inside sandboxed view CSP |
@@ -155,6 +158,9 @@ Configure these 3 variables directly in Cloud Run (**Variables & Secrets**):
 | `PLATFORM_S3_PREFIX` | Optional | `users` | Prefix isolating managed users (`<prefix>/<user_id>/...`) |
 | `PLATFORM_S3_FORCE_PATH_STYLE` | Optional | `false` | Set `true` if shared endpoint requires path-style addressing |
 | `PLATFORM_FREE_MB` | Optional | `50` | Per-user free quota in MB on the shared platform bucket |
+| `GOOGLE_CLIENT_ID` | Optional | `""` | Google OAuth Web Client ID for separate Google Drive sync |
+| `GOOGLE_CLIENT_SECRET` | Optional | `""` | Google OAuth Web Client Secret for Google Drive sync |
+| `GOOGLE_REDIRECT_URI` | Optional | Auto (`/api/drive/callback`) | Explicit OAuth redirect URI (set to `https://<frontend-domain>/api/drive/callback` when proxying through Vercel) |
 | `COOKIE_SECURE` | Production | `true` (in `Dockerfile`) | Enables `__Host-` cookie prefix and `Secure` attribute |
 | `ALLOWED_HOSTS` | Optional | `*` (in `Dockerfile`) | Comma-separated allowed `Host` headers |
 | `ALLOW_INSECURE_S3` | Optional | `false` | Set `true` only for plain-HTTP local/private S3 servers |

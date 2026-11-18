@@ -6,9 +6,9 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import auth, storage
+from . import auth, gdrive, storage
 from .db import get_db
-from .models import SharedLink, User, UserStorage
+from .models import SharedLink, User, UserGoogleDrive, UserStorage
 from .store import Store, StoreError
 
 router = APIRouter(prefix="/api/share", tags=["share"])
@@ -19,7 +19,15 @@ class ShareCreateIn(BaseModel):
     expiresHours: int | None = None
 
 
-def store_for_user(user_id: str, db: Session) -> Store:
+def active_provider(user_id: str, db: Session) -> str:
+    drive = db.get(UserGoogleDrive, user_id)
+    return "gdrive" if drive and drive.active else "s3"
+
+
+def store_for_user(user_id: str, db: Session, provider: str | None = None) -> Store | gdrive.DriveStore:
+    chosen = provider or active_provider(user_id, db)
+    if chosen == "gdrive":
+        return gdrive.drive_store_for_user(user_id, db)
     cfg = db.get(UserStorage, user_id)
     if cfg:
         return Store(
@@ -59,9 +67,12 @@ def _find_link(user_id: str, rel: str, db: Session) -> SharedLink | None:
 
 @router.get("")
 def get_share(path: str, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
-    store = store_for_user(user.id, db)
+    provider = active_provider(user.id, db)
+    store = store_for_user(user.id, db, provider)
     rel = store.page_rel(path)
     link = _find_link(user.id, rel, db)
+    if link and link.provider != provider:
+        return _share_out(None)
     if link and _is_expired(link):
         db.delete(link)
         db.commit()
@@ -76,18 +87,21 @@ def create_share(body: ShareCreateIn, user: User = Depends(auth.current_user), d
         if body.expiresHours < 1 or body.expiresHours > 8760:
             raise HTTPException(status_code=400, detail="Invalid expiry hours")
         expires_at = datetime.now(timezone.utc) + timedelta(hours=body.expiresHours)
-    store = store_for_user(user.id, db)
+    provider = active_provider(user.id, db)
+    store = store_for_user(user.id, db, provider)
     rel = store.page_rel(body.path)
-    if not store._head_exists(store.full_key(rel)):
+    if not store.page_exists(rel):
         raise StoreError(404, "Not found")
     link = _find_link(user.id, rel, db)
     if link:
+        link.provider = provider
         link.expires_at = expires_at
     else:
         link = SharedLink(
             token=secrets.token_urlsafe(18)[:24],
             user_id=user.id,
             page_path=rel,
+            provider=provider,
             expires_at=expires_at,
         )
         db.add(link)
@@ -96,24 +110,13 @@ def create_share(body: ShareCreateIn, user: User = Depends(auth.current_user), d
     return _share_out(link)
 
 
-@router.post("/presign")
-def presign_share(body: ShareCreateIn, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
-    expires_seconds = 86400
-    if body.expiresHours is not None:
-        if body.expiresHours < 1 or body.expiresHours > 168:
-            raise HTTPException(status_code=400, detail="Presigned URLs support 1 to 168 hours")
-        expires_seconds = body.expiresHours * 3600
-    store = store_for_user(user.id, db)
-    url = store.presigned_url(body.path, expires_seconds)
-    return {"url": url, "expiresIn": expires_seconds}
-
-
 @router.delete("")
 def revoke_share(path: str, user: User = Depends(auth.current_user), db: Session = Depends(get_db)):
-    store = store_for_user(user.id, db)
+    provider = active_provider(user.id, db)
+    store = store_for_user(user.id, db, provider)
     rel = store.page_rel(path)
     link = _find_link(user.id, rel, db)
-    if link:
+    if link and link.provider == provider:
         db.delete(link)
         db.commit()
     return _share_out(None)
@@ -128,9 +131,9 @@ def public_share(token: str, db: Session) -> str | None:
         db.commit()
         return None
     try:
-        store = store_for_user(link.user_id, db)
+        store = store_for_user(link.user_id, db, link.provider)
         return store.read_page(link.page_path)
-    except StoreError:
+    except (StoreError, FileNotFoundError):
         return None
 
 
@@ -139,8 +142,9 @@ def sync_renamed_shares(user_id: str, old_path: str, new_path: str, db: Session)
     new_clean = new_path.strip("/")
     if not old_clean or old_clean == new_clean:
         return
+    provider = active_provider(user_id, db)
     prefix = f"{old_clean}/"
-    rows = db.scalars(select(SharedLink).where(SharedLink.user_id == user_id)).all()
+    rows = db.scalars(select(SharedLink).where(SharedLink.user_id == user_id, SharedLink.provider == provider)).all()
     changed = False
     for row in rows:
         if row.page_path == old_clean:
@@ -157,8 +161,9 @@ def delete_removed_shares(user_id: str, removed_path: str, db: Session) -> None:
     clean = removed_path.strip("/")
     if not clean:
         return
+    provider = active_provider(user_id, db)
     prefix = f"{clean}/"
-    rows = db.scalars(select(SharedLink).where(SharedLink.user_id == user_id)).all()
+    rows = db.scalars(select(SharedLink).where(SharedLink.user_id == user_id, SharedLink.provider == provider)).all()
     changed = False
     for row in rows:
         if row.page_path == clean or row.page_path.startswith(prefix):

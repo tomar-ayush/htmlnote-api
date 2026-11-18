@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from . import auth, share, storage
+from . import auth, gdrive, share, storage
 from .db import get_db
 from .models import User
 from .store import Store, StoreError
@@ -70,10 +70,11 @@ async def not_found(_: Request, __: FileNotFoundError):
 
 app.include_router(auth.router)
 app.include_router(storage.router)
+app.include_router(gdrive.router)
 app.include_router(share.router)
 
 
-def user_store(user: User = Depends(auth.current_user), db: Session = Depends(get_db)) -> Store:
+def user_store(user: User = Depends(auth.current_user), db: Session = Depends(get_db)) -> Store | gdrive.DriveStore:
     return share.store_for_user(user.id, db)
 
 

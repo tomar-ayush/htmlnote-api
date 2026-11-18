@@ -333,7 +333,7 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
         alembic_cfg = AlembicConfig(str(BACKEND_DIR / "alembic.ini"))
         alembic_cfg.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
         script = ScriptDirectory.from_config(alembic_cfg)
-        self.assertEqual(script.get_heads(), ["0004"])
+        self.assertEqual(script.get_heads(), ["0005"])
         self.assertEqual(resolve_region("https://s3.us-west-004.backblazeb2.com", "auto"), "us-west-004")
         self.assertEqual(resolve_region("", "auto"), "us-east-1")
 
@@ -503,7 +503,7 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(s, 200)
             self.assertEqual(len(vers), 1)
             s, _, ver = await user_a.request("GET", f"/api/version?path=Work/Notes/First.html&id={vers[0]['id']}")
-            self.assertEqual((s, ver["html"]), (200, "<h1>Hello</h1>"))
+            self.assertEqual((s, ver["html"]), (200, "<head><title>First</title></head>\n<h1>Hello</h1>"))
 
             s, hdrs, body = await user_a.request("GET", "/page/Work/Notes/First.html")
             self.assertEqual(s, 200)
@@ -515,6 +515,9 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
 
             s, _, d = await user_a.request("POST", "/api/rename", {"path": "Work/Notes/First.html", "name": "Renamed"})
             self.assertEqual((s, d), (200, {"path": "Work/Notes/Renamed.html"}))
+            s, _, body = await user_a.request("GET", "/page/Work/Notes/Renamed.html")
+            self.assertEqual(s, 200)
+            self.assertIn("<head><title>Renamed</title></head>", body)
             s, _, vers = await user_a.request("GET", "/api/versions?path=Work/Notes/Renamed.html")
             self.assertEqual((s, len(vers)), (200, 1))
             s, _, d = await user_a.request("POST", "/api/rename", {"path": "Work/Notes", "name": "Docs"})
@@ -619,8 +622,7 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     os.environ[k] = v
 
-    async def test_share_links_and_presigned_url(self):
-        import urllib.request
+    async def test_share_links_and_html_title_sync(self):
         from datetime import datetime, timedelta, timezone
 
         from app.auth import hash_token
@@ -669,6 +671,10 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(s, 200)
 
+        s, _, body = await alice.request("GET", "/page/Work/Notes/Draft.html")
+        self.assertEqual(s, 200)
+        self.assertIn("<head><title>Draft</title></head>", body)
+
         s, _, d = await alice.request("GET", "/api/share?path=Work/Notes/Draft.html")
         self.assertEqual(s, 200)
         self.assertFalse(d["shared"])
@@ -684,6 +690,7 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
         s, h, body = await anon.request("GET", f"/s/{token}")
         self.assertEqual(s, 200)
         self.assertIn("<h1>Share Me</h1>", body)
+        self.assertIn("<title>Draft</title>", body)
         self.assertEqual(h.get("content-security-policy"), VIEW_CSP)
 
         s, _, d = await alice.request("POST", "/api/share", {"path": "Work/Notes/Draft.html", "expiresHours": None})
@@ -702,16 +709,10 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
 
         s, _, body = await anon.request("GET", f"/s/{token}")
         self.assertEqual(s, 200)
-        self.assertIn("<h1>Share Me</h1>", body)
+        self.assertIn("<title>Published</title>", body)
 
-        s, _, p = await alice.request("POST", "/api/share/presign", {"path": "Work/Notes/Published.html", "expiresHours": 24})
-        self.assertEqual(s, 200)
-        self.assertEqual(p["expiresIn"], 86400)
-        self.assertIn("X-Amz-Signature=", p["url"])
-        self.assertIn("response-content-type=text%2Fhtml", p["url"])
-        with urllib.request.urlopen(p["url"], timeout=5) as resp:
-            self.assertEqual(resp.status, 200)
-            self.assertIn(b"<h1>Share Me</h1>", resp.read())
+        s, _, _ = await alice.request("POST", "/api/share/presign", {"path": "Work/Notes/Published.html", "expiresHours": 24})
+        self.assertIn(s, (404, 405))
 
         s, _, d = await alice.request("DELETE", "/api/share?path=Work/Notes/Published.html")
         self.assertEqual(s, 200)
@@ -729,6 +730,298 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
             db.commit()
         s, _, _ = await anon.request("GET", f"/s/{exp_token}")
         self.assertEqual(s, 404)
+
+    async def test_google_drive_oauth_and_crud_and_provider_switch(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import re
+        from urllib.parse import parse_qs, unquote, urlsplit
+
+        from app.auth import hash_token
+        from app.models import SignupOtp
+
+        drive_files: dict[str, dict] = {}
+        drive_lock = threading.Lock()
+        seq = {"n": 0}
+
+        def next_id() -> str:
+            seq["n"] += 1
+            return f"drv_{seq['n']}"
+
+        def delete_subtree(fid: str) -> None:
+            children = [k for k, v in list(drive_files.items()) if fid in v.get("parents", [])]
+            for cid in children:
+                delete_subtree(cid)
+            drive_files.pop(fid, None)
+
+        class FakeGoogleHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args):
+                return
+
+            def _send_json(self, status: int, data: dict):
+                body = json.dumps(data).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _send_bytes(self, status: int, data: bytes, ctype: str = "text/html; charset=utf-8"):
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                u = urlsplit(self.path)
+                qs = parse_qs(u.query, keep_blank_values=True)
+                if u.path == "/oauth/userinfo":
+                    self._send_json(200, {"email": "writer@gmail.com"})
+                    return
+                if u.path == "/drive/v3/files":
+                    q = qs.get("q", [""])[0]
+                    with drive_lock:
+                        if "'root' in parents" in q:
+                            m = re.search(r"name='([^']+)'", q)
+                            target_name = m.group(1) if m else ""
+                            matches = [
+                                {k: v for k, v in item.items() if k != "data"}
+                                for item in drive_files.values()
+                                if "root" in item.get("parents", []) and item.get("name") == target_name
+                            ]
+                            self._send_json(200, {"files": matches})
+                            return
+                        files = [{k: v for k, v in item.items() if k != "data"} for item in drive_files.values()]
+                    self._send_json(200, {"files": files})
+                    return
+                if u.path.startswith("/drive/v3/files/") and qs.get("alt", [""])[0] == "media":
+                    fid = unquote(u.path.split("/")[-1])
+                    with drive_lock:
+                        item = drive_files.get(fid)
+                    if not item:
+                        self._send_json(404, {"error": {"message": "Not found"}})
+                        return
+                    self._send_bytes(200, item.get("data", b""))
+                    return
+                self._send_json(404, {"error": {"message": "Unknown route"}})
+
+            def do_POST(self):
+                u = urlsplit(self.path)
+                qs = parse_qs(u.query, keep_blank_values=True)
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length else b""
+                if u.path == "/oauth/token":
+                    self._send_json(
+                        200,
+                        {"access_token": "acc_123", "refresh_token": "ref_123", "expires_in": 3600},
+                    )
+                    return
+                if u.path == "/drive/v3/files":
+                    meta = json.loads(raw.decode("utf-8"))
+                    with drive_lock:
+                        fid = next_id()
+                        item = {
+                            "id": fid,
+                            "name": meta["name"],
+                            "mimeType": meta["mimeType"],
+                            "parents": meta.get("parents", []),
+                            "createdTime": "2026-11-18T10:00:00.000Z",
+                            "size": "0",
+                        }
+                        drive_files[fid] = item
+                    self._send_json(200, {"id": fid, "name": item["name"]})
+                    return
+                if u.path == "/upload/drive/v3/files" and qs.get("uploadType", [""])[0] == "multipart":
+                    ctype = self.headers.get("Content-Type", "")
+                    m = re.search(r"boundary=([^\s;]+)", ctype)
+                    boundary = m.group(1).encode("utf-8") if m else b""
+                    sections = raw.split(b"--" + boundary)
+                    parts = [s.split(b"\r\n\r\n", 1)[1].rstrip(b"\r\n") for s in sections if b"\r\n\r\n" in s]
+                    meta = json.loads(parts[0].decode("utf-8"))
+                    content = parts[1]
+                    with drive_lock:
+                        fid = next_id()
+                        drive_files[fid] = {
+                            "id": fid,
+                            "name": meta["name"],
+                            "mimeType": meta.get("mimeType", "text/html"),
+                            "parents": meta.get("parents", []),
+                            "createdTime": "2026-11-18T10:00:00.000Z",
+                            "size": str(len(content)),
+                            "data": content,
+                        }
+                    self._send_json(200, {"id": fid, "name": meta["name"]})
+                    return
+                self._send_json(404, {"error": {"message": "Unknown POST"}})
+
+            def do_PATCH(self):
+                u = urlsplit(self.path)
+                qs = parse_qs(u.query, keep_blank_values=True)
+                fid = unquote(u.path.split("/")[-1])
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length else b""
+                with drive_lock:
+                    item = drive_files.get(fid)
+                    if not item:
+                        self._send_json(404, {"error": {"message": "Not found"}})
+                        return
+                    if qs.get("uploadType", [""])[0] == "media":
+                        item["data"] = raw
+                        item["size"] = str(len(raw))
+                        self._send_json(200, {"id": fid, "name": item["name"]})
+                        return
+                    patch_meta = json.loads(raw.decode("utf-8"))
+                    if "name" in patch_meta:
+                        item["name"] = patch_meta["name"]
+                    self._send_json(200, {"id": fid, "name": item["name"]})
+
+            def do_DELETE(self):
+                u = urlsplit(self.path)
+                fid = unquote(u.path.split("/")[-1])
+                with drive_lock:
+                    if fid not in drive_files:
+                        self._send_json(404, {"error": {"message": "Not found"}})
+                        return
+                    delete_subtree(fid)
+                self._send_bytes(204, b"", "")
+
+        gserver = ThreadingHTTPServer(("127.0.0.1", 0), FakeGoogleHandler)
+        gthread = threading.Thread(target=gserver.serve_forever, daemon=True)
+        gthread.start()
+        gbase = f"http://127.0.0.1:{gserver.server_port}"
+        env_keys = (
+            "GOOGLE_CLIENT_ID",
+            "GOOGLE_CLIENT_SECRET",
+            "GOOGLE_TOKEN_URL",
+            "GOOGLE_USERINFO_URL",
+            "GOOGLE_DRIVE_API_BASE",
+            "GOOGLE_DRIVE_UPLOAD_BASE",
+        )
+        prev = {k: os.environ.get(k) for k in env_keys}
+        os.environ["GOOGLE_CLIENT_ID"] = "test-google-client-id"
+        os.environ["GOOGLE_CLIENT_SECRET"] = "test-google-secret"
+        os.environ["GOOGLE_TOKEN_URL"] = f"{gbase}/oauth/token"
+        os.environ["GOOGLE_USERINFO_URL"] = f"{gbase}/oauth/userinfo"
+        os.environ["GOOGLE_DRIVE_API_BASE"] = f"{gbase}/drive/v3"
+        os.environ["GOOGLE_DRIVE_UPLOAD_BASE"] = f"{gbase}/upload/drive/v3"
+        try:
+            user = AsgiClient(app)
+            await user.request("GET", "/api/auth/me")
+            with patch("app.auth.send_otp_email"):
+                s, _, _ = await user.request("POST", "/api/auth/signup", {"email": "drive@example.com", "password": "password123"})
+                self.assertEqual(s, 200)
+            with self.SessionLocal() as db:
+                otp = db.get(SignupOtp, "drive@example.com")
+                self.assertIsNotNone(otp)
+                otp.otp_hash = hash_token("drive@example.com:112233")
+                db.commit()
+            s, _, _ = await user.request("POST", "/api/auth/verify-signup", {"email": "drive@example.com", "code": "112233"})
+            self.assertEqual(s, 200)
+
+            s, _, cfg = await user.request("GET", "/api/storage")
+            self.assertEqual(s, 200)
+            self.assertTrue(cfg["driveAvailable"])
+
+            s, _, auth_res = await user.request("GET", "/api/drive/auth-url")
+            self.assertEqual(s, 200)
+            state = parse_qs(urlsplit(auth_res["url"]).query)["state"][0]
+
+            s, hdrs, _ = await user.request("GET", f"/api/drive/callback?code=mycode&state={state}")
+            self.assertEqual(s, 302)
+            self.assertEqual(hdrs.get("location"), "/?drive=connected")
+
+            s, _, cfg = await user.request("GET", "/api/storage")
+            self.assertEqual(s, 200)
+            self.assertEqual(cfg["mode"], "gdrive")
+            self.assertTrue(cfg["driveActive"])
+            self.assertTrue(cfg["driveConnected"])
+            self.assertEqual(cfg["driveEmail"], "writer@gmail.com")
+            self.assertEqual(cfg["driveFolderName"], "HTML Notebook")
+
+            s, _, _ = await user.request("POST", "/api/folder", {"parent": "", "name": "DriveNB"})
+            self.assertEqual(s, 200)
+            s, _, _ = await user.request("POST", "/api/folder", {"parent": "DriveNB", "name": "Ideas"})
+            self.assertEqual(s, 200)
+            s, _, _ = await user.request(
+                "POST",
+                "/api/page",
+                {
+                    "section": "DriveNB/Ideas",
+                    "name": "Plan",
+                    "html": "<!DOCTYPE html><html><head><title>Old</title></head><body><p>From Drive</p></body></html>",
+                },
+            )
+            self.assertEqual(s, 200)
+
+            s, _, html = await user.request("GET", "/page/DriveNB/Ideas/Plan.html")
+            self.assertEqual(s, 200)
+            self.assertIn("<title>Plan</title>", html)
+
+            s, _, _ = await user.request(
+                "PUT",
+                "/api/page?path=DriveNB/Ideas/Plan.html",
+                {"html": "<!DOCTYPE html><html><head><title>Plan</title></head><body><p>Updated Drive</p></body></html>", "keepVersion": True},
+            )
+            self.assertEqual(s, 200)
+            s, _, vers = await user.request("GET", "/api/versions?path=DriveNB/Ideas/Plan.html")
+            self.assertEqual((s, len(vers)), (200, 1))
+
+            s, _, renamed = await user.request("POST", "/api/rename", {"path": "DriveNB/Ideas/Plan.html", "name": "Final"})
+            self.assertEqual((s, renamed), (200, {"path": "DriveNB/Ideas/Final.html"}))
+            s, _, html = await user.request("GET", "/page/DriveNB/Ideas/Final.html")
+            self.assertEqual(s, 200)
+            self.assertIn("<title>Final</title>", html)
+
+            s, _, share_res = await user.request("POST", "/api/share", {"path": "DriveNB/Ideas/Final.html", "expiresHours": 24})
+            self.assertEqual(s, 200)
+            token = share_res["token"]
+
+            anon = AsgiClient(app)
+            s, _, shared_html = await anon.request("GET", f"/s/{token}")
+            self.assertEqual(s, 200)
+            self.assertIn("<p>Updated Drive</p>", shared_html)
+
+            s, _, _ = await user.request(
+                "PUT",
+                "/api/storage",
+                {
+                    "endpointUrl": self.endpoint,
+                    "region": "us-east-1",
+                    "bucket": "test-bucket",
+                    "accessKeyId": "test-access",
+                    "secretAccessKey": "test-secret",
+                    "prefix": "drive-switch-user",
+                    "forcePathStyle": True,
+                },
+            )
+            self.assertEqual(s, 200)
+            s, _, s3_tree = await user.request("GET", "/api/tree")
+            self.assertEqual((s, s3_tree), (200, []))
+
+            s, _, shared_html_still = await anon.request("GET", f"/s/{token}")
+            self.assertEqual(s, 200)
+            self.assertIn("<p>Updated Drive</p>", shared_html_still)
+
+            s, _, cfg = await user.request("POST", "/api/drive/provider", {"provider": "gdrive"})
+            self.assertEqual((s, cfg["mode"]), (200, "gdrive"))
+            s, _, d_tree = await user.request("GET", "/api/tree")
+            self.assertEqual(s, 200)
+            self.assertEqual(d_tree[0]["sections"][0]["pages"][0]["name"], "Final")
+
+            s, _, cfg = await user.request("DELETE", "/api/drive")
+            self.assertEqual(s, 200)
+            self.assertFalse(cfg["driveConnected"])
+            self.assertEqual(cfg["mode"], "custom")
+        finally:
+            gserver.shutdown()
+            gserver.server_close()
+            for k, v in prev.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 if __name__ == "__main__":

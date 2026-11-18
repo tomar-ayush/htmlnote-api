@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from .auth import COOKIE_SECURE, current_user
 from .db import get_db
-from .models import User, UserStorage
+from .models import User, UserGoogleDrive, UserStorage
 from .store import Store, StoreError, clean_prefix, validate_endpoint
 
 B2_ENDPOINT = re.compile(r"^https?://s3\.([a-z0-9-]+)\.backblazeb2\.com$", re.IGNORECASE)
@@ -95,52 +95,46 @@ class StorageIn(BaseModel):
     forcePathStyle: bool = False
 
 
-def public_storage(cfg: UserStorage | None, user_id: str) -> dict:
-    if cfg:
-        return {
-            "configured": True,
-            "mode": "custom",
-            "usedBytes": None,
-            "quotaBytes": None,
-            "endpointUrl": cfg.endpoint_url,
-            "region": cfg.region,
-            "bucket": cfg.bucket,
-            "accessKeyId": cfg.access_key_id,
-            "hasSecretKey": True,
-            "prefix": cfg.prefix,
-            "forcePathStyle": cfg.force_path_style,
-        }
-    if platform_storage_available():
+def drive_oauth_available() -> bool:
+    return bool(os.environ.get("GOOGLE_CLIENT_ID", "").strip() and os.environ.get("GOOGLE_CLIENT_SECRET", "").strip())
+
+
+def public_storage(cfg: UserStorage | None, user_id: str, drive: UserGoogleDrive | None = None) -> dict:
+    s3_mode = "custom" if cfg else ("managed" if platform_storage_available() else "none")
+    drive_active = bool(drive and drive.active)
+    mode = "gdrive" if drive_active else s3_mode
+    configured = drive_active or s3_mode != "none"
+    used = None
+    quota = None
+    if s3_mode == "managed":
+        quota = platform_quota_bytes()
         try:
             used = platform_store_for_user(user_id).used_bytes()
         except StoreError:
             used = 0
-        return {
-            "configured": True,
-            "mode": "managed",
-            "usedBytes": used,
-            "quotaBytes": platform_quota_bytes(),
-            "endpointUrl": "",
-            "region": "auto",
-            "bucket": "",
-            "accessKeyId": "",
-            "hasSecretKey": False,
-            "prefix": "",
-            "forcePathStyle": False,
-        }
     return {
-        "configured": False,
-        "mode": "none",
-        "usedBytes": None,
-        "quotaBytes": None,
-        "endpointUrl": "",
-        "region": "auto",
-        "bucket": "",
-        "accessKeyId": "",
-        "hasSecretKey": False,
-        "prefix": "",
-        "forcePathStyle": False,
+        "configured": configured,
+        "mode": mode,
+        "s3Mode": s3_mode,
+        "usedBytes": used,
+        "quotaBytes": quota,
+        "endpointUrl": cfg.endpoint_url if cfg else "",
+        "region": cfg.region if cfg else "auto",
+        "bucket": cfg.bucket if cfg else "",
+        "accessKeyId": cfg.access_key_id if cfg else "",
+        "hasSecretKey": bool(cfg),
+        "prefix": cfg.prefix if cfg else "",
+        "forcePathStyle": bool(cfg.force_path_style) if cfg else False,
+        "driveAvailable": drive_oauth_available(),
+        "driveConnected": bool(drive),
+        "driveActive": drive_active,
+        "driveEmail": drive.google_email if drive else "",
+        "driveFolderName": drive.root_folder_name if drive else "",
     }
+
+
+def public_storage_for_user(user_id: str, db: Session) -> dict:
+    return public_storage(db.get(UserStorage, user_id), user_id, db.get(UserGoogleDrive, user_id))
 
 
 def prepare_config(body: StorageIn, existing: UserStorage | None) -> tuple[str, str, str, str, str, str, bool]:
@@ -174,7 +168,7 @@ router = APIRouter(prefix="/api/storage")
 
 @router.get("")
 def get_storage(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    return public_storage(db.get(UserStorage, user.id), user.id)
+    return public_storage_for_user(user.id, db)
 
 
 @router.post("/test")
@@ -228,8 +222,11 @@ def save_storage(body: StorageIn, user: User = Depends(current_user), db: Sessio
             force_path_style=force_path_style,
         )
         db.add(cfg)
+    drive = db.get(UserGoogleDrive, user.id)
+    if drive and drive.active:
+        drive.active = False
     db.commit()
-    return public_storage(cfg, user.id)
+    return public_storage_for_user(user.id, db)
 
 
 @router.delete("")
@@ -238,4 +235,4 @@ def delete_storage(user: User = Depends(current_user), db: Session = Depends(get
     if cfg:
         db.delete(cfg)
         db.commit()
-    return public_storage(None, user.id)
+    return public_storage_for_user(user.id, db)

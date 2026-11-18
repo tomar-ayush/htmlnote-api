@@ -58,5 +58,20 @@ class SharedLink(Base):
     token: Mapped[str] = mapped_column(String(32), primary_key=True)
     user_id: Mapped[str] = mapped_column(String(32), ForeignKey("users.id", ondelete="CASCADE"), index=True)
     page_path: Mapped[str] = mapped_column(String(768))
+    provider: Mapped[str] = mapped_column(String(16), default="s3")
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class UserGoogleDrive(Base):
+    __tablename__ = "user_google_drive"
+
+    user_id: Mapped[str] = mapped_column(String(32), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    google_email: Mapped[str] = mapped_column(String(254), default="")
+    refresh_token_enc: Mapped[str] = mapped_column(String(2048))
+    access_token_enc: Mapped[str] = mapped_column(String(2048), default="")
+    token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    root_folder_id: Mapped[str] = mapped_column(String(128))
+    root_folder_name: Mapped[str] = mapped_column(String(255), default="HTML Notebook")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

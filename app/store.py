@@ -1,5 +1,6 @@
 from collections import OrderedDict
 import hashlib
+from html import escape as html_escape
 import ipaddress
 import os
 import re
@@ -17,6 +18,32 @@ VERSION_GAP_MS = 5 * 60 * 1000
 PAGE_EXT = re.compile(r"\.html?$", re.IGNORECASE)
 VERSION_ID = re.compile(r"^\d+\.html$")
 BAD_CHARS = re.compile(r'[/\\:*?"<>|\x00-\x1f]')
+TITLE_TAG = re.compile(r"<title\b[^>]*>.*?</title>", re.IGNORECASE | re.DOTALL)
+HEAD_OPEN = re.compile(r"<head\b[^>]*>", re.IGNORECASE)
+HTML_OPEN = re.compile(r"<html\b[^>]*>", re.IGNORECASE)
+DOCTYPE_LINE = re.compile(r"^\s*<!doctype[^>]*>\s*", re.IGNORECASE)
+
+
+def sync_html_title(raw_html: str, title: str) -> str:
+    clean_title = (title or "").strip() or "Untitled page"
+    tag = f"<title>{html_escape(clean_title)}</title>"
+    if not raw_html.strip():
+        return (
+            '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+            f"{tag}\n</head>\n<body><p><br></p></body>\n</html>\n"
+        )
+    if TITLE_TAG.search(raw_html):
+        return TITLE_TAG.sub(lambda _: tag, raw_html, count=1)
+    m = HEAD_OPEN.search(raw_html)
+    if m:
+        return raw_html[: m.end()] + "\n" + tag + raw_html[m.end() :]
+    m = HTML_OPEN.search(raw_html)
+    if m:
+        return raw_html[: m.end()] + f"\n<head>{tag}</head>" + raw_html[m.end() :]
+    m = DOCTYPE_LINE.match(raw_html)
+    if m:
+        return raw_html[: m.end()] + f"<head>{tag}</head>\n" + raw_html[m.end() :]
+    return f"<head>{tag}</head>\n{raw_html}"
 
 _CACHE_LOCK = threading.Lock()
 _ENDPOINT_CACHE: OrderedDict[tuple[str, bool], str] = OrderedDict()
@@ -429,30 +456,19 @@ class Store:
                 break
             i += 1
         rel = f"{sec_rel}/{filename}"
-        added = len(html.encode("utf-8"))
+        stem = PAGE_EXT.sub("", filename)
+        content = sync_html_title(html, stem)
+        added = len(content.encode("utf-8"))
         self._check_quota(added)
-        self._put_text(self.full_key(rel), html)
+        self._put_text(self.full_key(rel), content)
         self._adjust_usage(added)
         return {"path": rel}
 
+    def page_exists(self, rel: str) -> bool:
+        return self._head_exists(self.full_key(self.page_rel(rel)))
+
     def read_page(self, rel: str) -> str:
         return self._get_text(self.full_key(self.page_rel(rel)))
-
-    def presigned_url(self, rel: str, expires_seconds: int = 86400) -> str:
-        key = self.full_key(self.page_rel(rel))
-        if not self._head_exists(key):
-            raise StoreError(404, "Not found")
-        ttl = max(60, min(604800, int(expires_seconds)))
-        return self._call(
-            self.client.generate_presigned_url,
-            "get_object",
-            Params={
-                "Bucket": self.bucket,
-                "Key": key,
-                "ResponseContentType": "text/html; charset=utf-8",
-            },
-            ExpiresIn=ttl,
-        )
 
     def write_page(self, rel: str, html: str, keep_version: bool) -> dict:
         clean = self.page_rel(rel)
@@ -536,19 +552,27 @@ class Store:
             src_key = self.full_key(src_rel)
             if not self._head_exists(src_key):
                 raise FileNotFoundError()
-            dst_rel = "/".join([*parts[:-1], f"{PAGE_EXT.sub('', self.clean_name(name))}.html"])
+            new_stem = PAGE_EXT.sub("", self.clean_name(name))
+            dst_rel = "/".join([*parts[:-1], f"{new_stem}.html"])
             if dst_rel == src_rel:
                 return {"path": src_rel}
             dst_key = self.full_key(dst_rel)
             if self._head_exists(dst_key):
                 raise StoreError(409, "Already exists")
-            self._copy_key(src_key, dst_key)
+            old_html = self._get_text(src_key)
+            updated_html = sync_html_title(old_html, new_stem)
+            old_len = len(old_html.encode("utf-8"))
+            new_len = len(updated_html.encode("utf-8"))
+            if new_len > old_len:
+                self._check_quota(new_len - old_len)
+            self._put_text(dst_key, updated_html)
             old_ver_prefix = self.full_key(f".versions/{src_rel}/")
             new_ver_prefix = self.full_key(f".versions/{dst_rel}/")
             ver_objs = self._list(f".versions/{src_rel}/")
             for obj in ver_objs:
                 self._copy_key(obj["Key"], new_ver_prefix + obj["Key"][len(old_ver_prefix) :])
             self._delete_keys([src_key, *(o["Key"] for o in ver_objs)])
+            self._adjust_usage(new_len - old_len)
             _evict_snapshot(self.endpoint_url, self.bucket, src_key)
             return {"path": dst_rel}
         if len(parts) not in (1, 2):
