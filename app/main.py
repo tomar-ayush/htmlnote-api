@@ -74,17 +74,19 @@ app.include_router(storage.router)
 
 def user_store(user: User = Depends(auth.current_user), db: Session = Depends(get_db)) -> Store:
     cfg = db.get(UserStorage, user.id)
-    if not cfg:
-        raise StoreError(400, "Configure object storage first")
-    return Store(
-        endpoint_url=cfg.endpoint_url,
-        region=cfg.region,
-        bucket=cfg.bucket,
-        access_key_id=cfg.access_key_id,
-        secret_access_key=storage.decrypt_secret(cfg.secret_key_enc),
-        prefix=cfg.prefix,
-        force_path_style=cfg.force_path_style,
-    )
+    if cfg:
+        return Store(
+            endpoint_url=cfg.endpoint_url,
+            region=cfg.region,
+            bucket=cfg.bucket,
+            access_key_id=cfg.access_key_id,
+            secret_access_key=storage.decrypt_secret(cfg.secret_key_enc),
+            prefix=cfg.prefix,
+            force_path_style=cfg.force_path_style,
+        )
+    if storage.platform_storage_available():
+        return storage.platform_store_for_user(user.id)
+    raise StoreError(400, "Configure object storage first")
 
 
 class FolderIn(BaseModel):

@@ -22,6 +22,8 @@ _CACHE_LOCK = threading.Lock()
 _ENDPOINT_CACHE: OrderedDict[tuple[str, bool], str] = OrderedDict()
 _CLIENT_CACHE: OrderedDict[tuple[str, str, str, str, bool], object] = OrderedDict()
 _LAST_SNAPSHOT: OrderedDict[tuple[str, str, str], int] = OrderedDict()
+_USAGE_CACHE: OrderedDict[tuple[str, str, str], tuple[int, float]] = OrderedDict()
+USAGE_TTL_SEC = 15.0
 
 
 class StoreError(Exception):
@@ -133,13 +135,60 @@ class Store:
         secret_access_key: str,
         prefix: str = "",
         force_path_style: bool = False,
+        quota_bytes: int | None = None,
     ):
         self.endpoint_url = validate_endpoint(endpoint_url)
         self.region = (region or "").strip() or "auto"
         self.bucket = (bucket or "").strip()
         cleaned = clean_prefix(prefix)
         self.base_prefix = f"{cleaned}/" if cleaned else ""
+        self.quota_bytes = quota_bytes
         self.client = _get_client(self.endpoint_url, self.region, access_key_id, secret_access_key, force_path_style)
+
+    def _usage_key(self) -> tuple[str, str, str]:
+        return (self.endpoint_url, self.bucket, self.base_prefix)
+
+    def used_bytes(self, refresh: bool = False) -> int:
+        ukey = self._usage_key()
+        if not refresh:
+            with _CACHE_LOCK:
+                entry = _USAGE_CACHE.get(ukey)
+                if entry is not None and time.monotonic() - entry[1] < USAGE_TTL_SEC:
+                    _USAGE_CACHE.move_to_end(ukey)
+                    return entry[0]
+        total = sum(int(obj.get("Size", 0)) for obj in self._list(""))
+        with _CACHE_LOCK:
+            _USAGE_CACHE[ukey] = (total, time.monotonic())
+            _USAGE_CACHE.move_to_end(ukey)
+            if len(_USAGE_CACHE) > 512:
+                _USAGE_CACHE.popitem(last=False)
+        return total
+
+    def _adjust_usage(self, delta: int) -> None:
+        ukey = self._usage_key()
+        with _CACHE_LOCK:
+            entry = _USAGE_CACHE.get(ukey)
+            if entry is not None:
+                _USAGE_CACHE[ukey] = (max(0, entry[0] + delta), entry[1])
+
+    def _invalidate_usage(self) -> None:
+        ukey = self._usage_key()
+        with _CACHE_LOCK:
+            _USAGE_CACHE.pop(ukey, None)
+
+    def _check_quota(self, added_bytes: int) -> None:
+        if self.quota_bytes is None:
+            return
+        needed = max(0, added_bytes)
+        if self.used_bytes() + needed <= self.quota_bytes:
+            return
+        if self.used_bytes(refresh=True) + needed <= self.quota_bytes:
+            return
+        limit_mb = max(1, round(self.quota_bytes / (1024 * 1024)))
+        raise StoreError(
+            413,
+            f"Free {limit_mb} MB storage limit reached. Connect your own S3 or R2 bucket in Storage for unlimited space.",
+        )
 
     def _call(self, fn, *args, **kwargs):
         try:
@@ -380,7 +429,10 @@ class Store:
                 break
             i += 1
         rel = f"{sec_rel}/{filename}"
+        added = len(html.encode("utf-8"))
+        self._check_quota(added)
         self._put_text(self.full_key(rel), html)
+        self._adjust_usage(added)
         return {"path": rel}
 
     def read_page(self, rel: str) -> str:
@@ -391,17 +443,24 @@ class Store:
         key = self.full_key(clean)
         snap_key = (self.endpoint_url, self.bucket, key)
         now = self.now_ms()
+        new_size = len(html.encode("utf-8"))
         if not keep_version:
             with _CACHE_LOCK:
                 last = _LAST_SNAPSHOT.get(snap_key)
                 if last is not None:
                     _LAST_SNAPSHOT.move_to_end(snap_key)
             if last is not None and now - last < VERSION_GAP_MS:
-                self._put_text(key, html)
-                return {"saved": True}
+                if self.quota_bytes is None or self.used_bytes() + new_size <= self.quota_bytes:
+                    self._put_text(key, html)
+                    self._invalidate_usage()
+                    return {"saved": True}
         prev = self._get_text(key)
         if prev == html:
             return {"saved": False}
+        prev_size = len(prev.encode("utf-8"))
+        items = self.version_items(clean) if self.quota_bytes is not None else []
+        will_snap = keep_version or not items or now - int(items[-1][0].split(".")[0]) >= VERSION_GAP_MS
+        self._check_quota(new_size if will_snap else max(0, new_size - prev_size))
         self.snapshot(clean, prev, keep_version)
         with _CACHE_LOCK:
             _LAST_SNAPSHOT[snap_key] = now
@@ -409,6 +468,7 @@ class Store:
             if len(_LAST_SNAPSHOT) > 2048:
                 _LAST_SNAPSHOT.popitem(last=False)
         self._put_text(key, html)
+        self._invalidate_usage()
         return {"saved": True}
 
     def now_ms(self) -> int:
@@ -510,6 +570,7 @@ class Store:
             ver_objs = self._list(f".versions/{src_rel}/")
             self._delete_keys([src_key, *(o["Key"] for o in ver_objs)])
             _evict_snapshot(self.endpoint_url, self.bucket, src_key)
+            self._invalidate_usage()
             sec_rel = f"{parts[0]}/{parts[1]}"
             if not self._list_one(f"{sec_rel}/"):
                 self._put_keep(sec_rel)
@@ -522,6 +583,7 @@ class Store:
         ver_objs = self._list(f".versions/{src_rel}/")
         self._delete_keys([*(o["Key"] for o in old_objs), *(o["Key"] for o in ver_objs)])
         _evict_snapshot(self.endpoint_url, self.bucket, self.full_key(f"{src_rel}/"), is_prefix=True)
+        self._invalidate_usage()
         if len(parts) == 2 and not self._list_one(f"{parts[0]}/"):
             self._put_keep(parts[0])
         return {"removed": True}

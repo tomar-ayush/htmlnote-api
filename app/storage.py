@@ -48,6 +48,43 @@ def resolve_region(endpoint_url: str, region: str) -> str:
     return clean_region or "auto"
 
 
+def platform_storage_available() -> bool:
+    return bool(
+        os.environ.get("PLATFORM_S3_BUCKET", "").strip()
+        and os.environ.get("PLATFORM_S3_ACCESS_KEY_ID", "").strip()
+        and os.environ.get("PLATFORM_S3_SECRET_ACCESS_KEY", "").strip()
+    )
+
+
+def platform_quota_bytes() -> int:
+    try:
+        mb = int(float(os.environ.get("PLATFORM_FREE_MB", "50").strip() or "50"))
+    except ValueError:
+        mb = 50
+    return max(1, mb) * 1024 * 1024
+
+
+def platform_store_for_user(user_id: str) -> Store:
+    endpoint = os.environ.get("PLATFORM_S3_ENDPOINT_URL", "").strip()
+    region = os.environ.get("PLATFORM_S3_REGION", "auto").strip() or "auto"
+    bucket = os.environ.get("PLATFORM_S3_BUCKET", "").strip()
+    access_key = os.environ.get("PLATFORM_S3_ACCESS_KEY_ID", "").strip()
+    secret_key = os.environ.get("PLATFORM_S3_SECRET_ACCESS_KEY", "").strip()
+    base = clean_prefix(os.environ.get("PLATFORM_S3_PREFIX", "users"))
+    prefix = f"{base}/{user_id}" if base else user_id
+    path_style = os.environ.get("PLATFORM_S3_FORCE_PATH_STYLE", "false").lower() == "true"
+    return Store(
+        endpoint_url=endpoint,
+        region=resolve_region(endpoint, region),
+        bucket=bucket,
+        access_key_id=access_key,
+        secret_access_key=secret_key,
+        prefix=prefix,
+        force_path_style=path_style,
+        quota_bytes=platform_quota_bytes(),
+    )
+
+
 class StorageIn(BaseModel):
     endpointUrl: str = ""
     region: str = "auto"
@@ -58,10 +95,31 @@ class StorageIn(BaseModel):
     forcePathStyle: bool = False
 
 
-def public_storage(cfg: UserStorage | None) -> dict:
-    if not cfg:
+def public_storage(cfg: UserStorage | None, user_id: str) -> dict:
+    if cfg:
         return {
-            "configured": False,
+            "configured": True,
+            "mode": "custom",
+            "usedBytes": None,
+            "quotaBytes": None,
+            "endpointUrl": cfg.endpoint_url,
+            "region": cfg.region,
+            "bucket": cfg.bucket,
+            "accessKeyId": cfg.access_key_id,
+            "hasSecretKey": True,
+            "prefix": cfg.prefix,
+            "forcePathStyle": cfg.force_path_style,
+        }
+    if platform_storage_available():
+        try:
+            used = platform_store_for_user(user_id).used_bytes()
+        except StoreError:
+            used = 0
+        return {
+            "configured": True,
+            "mode": "managed",
+            "usedBytes": used,
+            "quotaBytes": platform_quota_bytes(),
             "endpointUrl": "",
             "region": "auto",
             "bucket": "",
@@ -71,14 +129,17 @@ def public_storage(cfg: UserStorage | None) -> dict:
             "forcePathStyle": False,
         }
     return {
-        "configured": True,
-        "endpointUrl": cfg.endpoint_url,
-        "region": cfg.region,
-        "bucket": cfg.bucket,
-        "accessKeyId": cfg.access_key_id,
-        "hasSecretKey": True,
-        "prefix": cfg.prefix,
-        "forcePathStyle": cfg.force_path_style,
+        "configured": False,
+        "mode": "none",
+        "usedBytes": None,
+        "quotaBytes": None,
+        "endpointUrl": "",
+        "region": "auto",
+        "bucket": "",
+        "accessKeyId": "",
+        "hasSecretKey": False,
+        "prefix": "",
+        "forcePathStyle": False,
     }
 
 
@@ -113,7 +174,7 @@ router = APIRouter(prefix="/api/storage")
 
 @router.get("")
 def get_storage(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    return public_storage(db.get(UserStorage, user.id))
+    return public_storage(db.get(UserStorage, user.id), user.id)
 
 
 @router.post("/test")
@@ -168,7 +229,7 @@ def save_storage(body: StorageIn, user: User = Depends(current_user), db: Sessio
         )
         db.add(cfg)
     db.commit()
-    return public_storage(cfg)
+    return public_storage(cfg, user.id)
 
 
 @router.delete("")
@@ -177,4 +238,4 @@ def delete_storage(user: User = Depends(current_user), db: Session = Depends(get
     if cfg:
         db.delete(cfg)
         db.commit()
-    return public_storage(None)
+    return public_storage(None, user.id)

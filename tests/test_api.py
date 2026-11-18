@@ -443,6 +443,7 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
             s, _, d = await user_a.request("GET", "/api/storage")
             self.assertEqual(s, 200)
             self.assertFalse(d["configured"])
+            self.assertEqual(d["mode"], "none")
             s, _, _ = await user_a.request("GET", "/api/tree")
             self.assertEqual(s, 400)
 
@@ -472,6 +473,7 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
             s, _, d = await user_a.request("PUT", "/api/storage", payload_a)
             self.assertEqual(s, 200)
             self.assertTrue(d["configured"])
+            self.assertEqual(d["mode"], "custom")
             self.assertTrue(d["hasSecretKey"])
             self.assertNotIn("secretAccessKey", d)
 
@@ -552,8 +554,70 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
             s, _, d = await user_a.request("DELETE", "/api/storage")
             self.assertEqual(s, 200)
             self.assertFalse(d["configured"])
+            self.assertEqual(d["mode"], "none")
             s, _, _ = await user_a.request("GET", "/api/tree")
             self.assertEqual(s, 400)
+
+    async def test_managed_shared_r2_tier_and_quota(self):
+        env_keys = (
+            "PLATFORM_S3_ENDPOINT_URL",
+            "PLATFORM_S3_REGION",
+            "PLATFORM_S3_BUCKET",
+            "PLATFORM_S3_ACCESS_KEY_ID",
+            "PLATFORM_S3_SECRET_ACCESS_KEY",
+            "PLATFORM_S3_PREFIX",
+            "PLATFORM_S3_FORCE_PATH_STYLE",
+            "PLATFORM_FREE_MB",
+        )
+        prev = {k: os.environ.get(k) for k in env_keys}
+        os.environ["PLATFORM_S3_ENDPOINT_URL"] = self.endpoint
+        os.environ["PLATFORM_S3_REGION"] = "auto"
+        os.environ["PLATFORM_S3_BUCKET"] = "test-bucket"
+        os.environ["PLATFORM_S3_ACCESS_KEY_ID"] = "PLAT"
+        os.environ["PLATFORM_S3_SECRET_ACCESS_KEY"] = "PLAT_SEC"
+        os.environ["PLATFORM_S3_PREFIX"] = "managed"
+        os.environ["PLATFORM_S3_FORCE_PATH_STYLE"] = "true"
+        os.environ["PLATFORM_FREE_MB"] = "1"
+        try:
+            with patch("app.auth.send_otp_email"):
+                user = AsgiClient(app)
+                await user.request("GET", "/api/auth/me")
+                s, _, d = await user.request("POST", "/api/auth/signup", {"email": "free@example.com", "password": "password123"})
+                self.assertEqual(s, 200)
+            with self.SessionLocal() as db:
+                from app.models import SignupOtp
+                otp = db.get(SignupOtp, "free@example.com")
+                self.assertIsNotNone(otp)
+                otp.otp_hash = auth_mod.hash_token("free@example.com:654321")
+                db.commit()
+            s, _, d = await user.request("POST", "/api/auth/verify-signup", {"email": "free@example.com", "code": "654321"})
+            self.assertEqual(s, 200)
+            uid = d["user"]["id"]
+
+            s, _, d = await user.request("GET", "/api/storage")
+            self.assertEqual(s, 200)
+            self.assertTrue(d["configured"])
+            self.assertEqual(d["mode"], "managed")
+            self.assertEqual(d["quotaBytes"], 1024 * 1024)
+
+            s, _, _ = await user.request("POST", "/api/folder", {"parent": "", "name": "Starter"})
+            self.assertEqual(s, 200)
+            s, _, _ = await user.request("POST", "/api/folder", {"parent": "Starter", "name": "Notes"})
+            self.assertEqual(s, 200)
+            s, _, _ = await user.request("POST", "/api/page", {"section": "Starter/Notes", "name": "Ok", "html": "<p>hi</p>"})
+            self.assertEqual(s, 200)
+            with LOCK:
+                self.assertIn(f"managed/{uid}/Starter/Notes/Ok.html", BUCKETS["test-bucket"])
+
+            oversize = "<p>" + ("x" * (1024 * 1024 + 64)) + "</p>"
+            s, _, _ = await user.request("POST", "/api/page", {"section": "Starter/Notes", "name": "TooBig", "html": oversize})
+            self.assertEqual(s, 413)
+        finally:
+            for k, v in prev.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 if __name__ == "__main__":

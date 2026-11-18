@@ -142,6 +142,14 @@ Configure these 3 variables directly in Cloud Run (**Variables & Secrets**):
 | `BREVO_API_KEY` | Yes (Production) | `""` | Brevo transactional API key (`xkeysib-...`) for sending signup OTP verification emails |
 | `BREVO_SENDER_EMAIL` | Yes (Production) | `""` | Verified sender email address in your Brevo account |
 | `BREVO_SENDER_NAME` | Optional | `HTML Notebook` | Display name used on signup verification emails |
+| `PLATFORM_S3_ENDPOINT_URL` | Optional | `""` | Shared R2 / S3 endpoint for zero-setup 50 MB free tier |
+| `PLATFORM_S3_REGION` | Optional | `auto` | Region for shared platform bucket |
+| `PLATFORM_S3_BUCKET` | Optional | `""` | Shared bucket name (setting bucket + keys enables free managed storage) |
+| `PLATFORM_S3_ACCESS_KEY_ID` | Optional | `""` | Access Key ID for shared platform bucket |
+| `PLATFORM_S3_SECRET_ACCESS_KEY` | Optional | `""` | Secret Access Key for shared platform bucket |
+| `PLATFORM_S3_PREFIX` | Optional | `users` | Prefix isolating managed users (`<prefix>/<user_id>/...`) |
+| `PLATFORM_S3_FORCE_PATH_STYLE` | Optional | `false` | Set `true` if shared endpoint requires path-style addressing |
+| `PLATFORM_FREE_MB` | Optional | `50` | Per-user free quota in MB on the shared platform bucket |
 | `COOKIE_SECURE` | Production | `true` (in `Dockerfile`) | Enables `__Host-` cookie prefix and `Secure` attribute |
 | `ALLOWED_HOSTS` | Optional | `*` (in `Dockerfile`) | Comma-separated allowed `Host` headers |
 | `ALLOW_INSECURE_S3` | Optional | `false` | Set `true` only for plain-HTTP local/private S3 servers |
