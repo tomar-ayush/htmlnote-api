@@ -11,9 +11,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from . import auth, storage
+from . import auth, share, storage
 from .db import get_db
-from .models import User, UserStorage
+from .models import User
 from .store import Store, StoreError
 
 EDIT_CSP = "script-src 'none'; object-src 'none'; base-uri 'none'"
@@ -70,23 +70,11 @@ async def not_found(_: Request, __: FileNotFoundError):
 
 app.include_router(auth.router)
 app.include_router(storage.router)
+app.include_router(share.router)
 
 
 def user_store(user: User = Depends(auth.current_user), db: Session = Depends(get_db)) -> Store:
-    cfg = db.get(UserStorage, user.id)
-    if cfg:
-        return Store(
-            endpoint_url=cfg.endpoint_url,
-            region=cfg.region,
-            bucket=cfg.bucket,
-            access_key_id=cfg.access_key_id,
-            secret_access_key=storage.decrypt_secret(cfg.secret_key_enc),
-            prefix=cfg.prefix,
-            force_path_style=cfg.force_path_style,
-        )
-    if storage.platform_storage_available():
-        return storage.platform_store_for_user(user.id)
-    raise StoreError(400, "Configure object storage first")
+    return share.store_for_user(user.id, db)
 
 
 class FolderIn(BaseModel):
@@ -136,13 +124,27 @@ def save_page(path: str, body: SaveIn, store: Store = Depends(user_store)):
 
 
 @app.post("/api/rename")
-def rename(body: RenameIn, store: Store = Depends(user_store)):
-    return store.rename(body.path, body.name)
+def rename(
+    body: RenameIn,
+    user: User = Depends(auth.current_user),
+    db: Session = Depends(get_db),
+    store: Store = Depends(user_store),
+):
+    res = store.rename(body.path, body.name)
+    share.sync_renamed_shares(user.id, body.path, res["path"], db)
+    return res
 
 
 @app.delete("/api/item")
-def remove(path: str, store: Store = Depends(user_store)):
-    return store.remove(path)
+def remove(
+    path: str,
+    user: User = Depends(auth.current_user),
+    db: Session = Depends(get_db),
+    store: Store = Depends(user_store),
+):
+    res = store.remove(path)
+    share.delete_removed_shares(user.id, path, db)
+    return res
 
 
 @app.get("/api/versions")
@@ -167,6 +169,18 @@ def edit_page(path: str, store: Store = Depends(user_store)):
 @app.get("/view/{path:path}")
 def view_page(path: str, store: Store = Depends(user_store)):
     return page_response(store.read_page(path), VIEW_CSP)
+
+
+@app.get("/s/{token}")
+def shared_page(token: str, db: Session = Depends(get_db)):
+    html = share.public_share(token, db)
+    if html is None:
+        return HTMLResponse(
+            "<!DOCTYPE html><html><body style='font-family:system-ui;padding:48px;color:#475467'><h2>Shared note not found or expired</h2></body></html>",
+            status_code=404,
+            headers={"Content-Security-Policy": VIEW_CSP, "Cache-Control": "no-store"},
+        )
+    return page_response(html, VIEW_CSP)
 
 
 if STATIC_DIR.is_dir():

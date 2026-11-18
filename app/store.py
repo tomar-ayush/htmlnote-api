@@ -438,6 +438,22 @@ class Store:
     def read_page(self, rel: str) -> str:
         return self._get_text(self.full_key(self.page_rel(rel)))
 
+    def presigned_url(self, rel: str, expires_seconds: int = 86400) -> str:
+        key = self.full_key(self.page_rel(rel))
+        if not self._head_exists(key):
+            raise StoreError(404, "Not found")
+        ttl = max(60, min(604800, int(expires_seconds)))
+        return self._call(
+            self.client.generate_presigned_url,
+            "get_object",
+            Params={
+                "Bucket": self.bucket,
+                "Key": key,
+                "ResponseContentType": "text/html; charset=utf-8",
+            },
+            ExpiresIn=ttl,
+        )
+
     def write_page(self, rel: str, html: str, keep_version: bool) -> dict:
         clean = self.page_rel(rel)
         key = self.full_key(clean)

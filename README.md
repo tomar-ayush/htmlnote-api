@@ -95,8 +95,13 @@ External agents or automation scripts only need to upload `[S3_PREFIX/]<notebook
 | `DELETE` | `/api/item?path=...` | Delete notebook, section, or page (preserving parent markers) |
 | `GET` | `/api/versions?path=...` | List up to 10 saved page versions |
 | `GET` | `/api/version?path=...&id=...` | Fetch HTML for a specific saved version |
+| `GET` | `/api/share?path=...` | Get public share link status for a page |
+| `POST` | `/api/share` | Create or update public share link with optional expiry |
+| `DELETE` | `/api/share?path=...` | Revoke public share link for a page |
+| `POST` | `/api/share/presign` | Generate direct S3/R2 presigned GET URL (`1h–7d`) |
 | `GET` | `/page/{path}` | Serve raw HTML with script-disabled edit CSP |
 | `GET` | `/view/{path}` | Serve HTML inside sandboxed view CSP |
+| `GET` | `/s/{token}` | Serve publicly shared page read-only inside sandboxed view CSP |
 
 ---
 

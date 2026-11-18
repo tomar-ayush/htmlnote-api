@@ -333,7 +333,7 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
         alembic_cfg = AlembicConfig(str(BACKEND_DIR / "alembic.ini"))
         alembic_cfg.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
         script = ScriptDirectory.from_config(alembic_cfg)
-        self.assertEqual(script.get_heads(), ["0003"])
+        self.assertEqual(script.get_heads(), ["0004"])
         self.assertEqual(resolve_region("https://s3.us-west-004.backblazeb2.com", "auto"), "us-west-004")
         self.assertEqual(resolve_region("", "auto"), "us-east-1")
 
@@ -618,6 +618,117 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+    async def test_share_links_and_presigned_url(self):
+        import urllib.request
+        from datetime import datetime, timedelta, timezone
+
+        from app.auth import hash_token
+        from app.main import VIEW_CSP
+        from app.models import SharedLink, SignupOtp
+
+        alice = AsgiClient(app)
+        await alice.request("GET", "/api/auth/me")
+        with patch("app.auth.send_otp_email"):
+            s, _, _ = await alice.request(
+                "POST",
+                "/api/auth/signup",
+                {"email": "sharer@example.com", "password": "password123"},
+            )
+            self.assertEqual(s, 200)
+        with self.SessionLocal() as db:
+            otp = db.get(SignupOtp, "sharer@example.com")
+            self.assertIsNotNone(otp)
+            otp.otp_hash = hash_token("sharer@example.com:123456")
+            db.commit()
+        s, _, _ = await alice.request("POST", "/api/auth/verify-signup", {"email": "sharer@example.com", "code": "123456"})
+        self.assertEqual(s, 200)
+
+        s, _, _ = await alice.request(
+            "PUT",
+            "/api/storage",
+            {
+                "endpointUrl": self.endpoint,
+                "region": "us-east-1",
+                "bucket": "test-bucket",
+                "accessKeyId": "test-access",
+                "secretAccessKey": "test-secret",
+                "prefix": "share-user",
+                "forcePathStyle": True,
+            },
+        )
+        self.assertEqual(s, 200)
+        s, _, _ = await alice.request("POST", "/api/folder", {"parent": "", "name": "Work"})
+        self.assertEqual(s, 200)
+        s, _, _ = await alice.request("POST", "/api/folder", {"parent": "Work", "name": "Notes"})
+        self.assertEqual(s, 200)
+        s, _, _ = await alice.request(
+            "POST",
+            "/api/page",
+            {"section": "Work/Notes", "name": "Draft", "html": "<!doctype html><html><body><h1>Share Me</h1></body></html>"},
+        )
+        self.assertEqual(s, 200)
+
+        s, _, d = await alice.request("GET", "/api/share?path=Work/Notes/Draft.html")
+        self.assertEqual(s, 200)
+        self.assertFalse(d["shared"])
+
+        s, _, d = await alice.request("POST", "/api/share", {"path": "Work/Notes/Draft.html", "expiresHours": 24})
+        self.assertEqual(s, 200)
+        self.assertTrue(d["shared"])
+        token = d["token"]
+        self.assertEqual(d["url"], f"/s/{token}")
+        self.assertIsNotNone(d["expiresAt"])
+
+        anon = AsgiClient(app)
+        s, h, body = await anon.request("GET", f"/s/{token}")
+        self.assertEqual(s, 200)
+        self.assertIn("<h1>Share Me</h1>", body)
+        self.assertEqual(h.get("content-security-policy"), VIEW_CSP)
+
+        s, _, d = await alice.request("POST", "/api/share", {"path": "Work/Notes/Draft.html", "expiresHours": None})
+        self.assertEqual(s, 200)
+        self.assertEqual(d["token"], token)
+        self.assertIsNone(d["expiresAt"])
+
+        s, _, r = await alice.request("POST", "/api/rename", {"path": "Work/Notes/Draft.html", "name": "Published"})
+        self.assertEqual(s, 200)
+        self.assertEqual(r["path"], "Work/Notes/Published.html")
+
+        s, _, d = await alice.request("GET", "/api/share?path=Work/Notes/Published.html")
+        self.assertEqual(s, 200)
+        self.assertTrue(d["shared"])
+        self.assertEqual(d["token"], token)
+
+        s, _, body = await anon.request("GET", f"/s/{token}")
+        self.assertEqual(s, 200)
+        self.assertIn("<h1>Share Me</h1>", body)
+
+        s, _, p = await alice.request("POST", "/api/share/presign", {"path": "Work/Notes/Published.html", "expiresHours": 24})
+        self.assertEqual(s, 200)
+        self.assertEqual(p["expiresIn"], 86400)
+        self.assertIn("X-Amz-Signature=", p["url"])
+        self.assertIn("response-content-type=text%2Fhtml", p["url"])
+        with urllib.request.urlopen(p["url"], timeout=5) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIn(b"<h1>Share Me</h1>", resp.read())
+
+        s, _, d = await alice.request("DELETE", "/api/share?path=Work/Notes/Published.html")
+        self.assertEqual(s, 200)
+        self.assertFalse(d["shared"])
+        s, _, _ = await anon.request("GET", f"/s/{token}")
+        self.assertEqual(s, 404)
+
+        s, _, d = await alice.request("POST", "/api/share", {"path": "Work/Notes/Published.html", "expiresHours": 1})
+        self.assertEqual(s, 200)
+        exp_token = d["token"]
+        with self.SessionLocal() as db:
+            row = db.get(SharedLink, exp_token)
+            self.assertIsNotNone(row)
+            row.expires_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+            db.commit()
+        s, _, _ = await anon.request("GET", f"/s/{exp_token}")
+        self.assertEqual(s, 404)
 
 
 if __name__ == "__main__":
