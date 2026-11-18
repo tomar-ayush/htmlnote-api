@@ -96,4 +96,5 @@ jobs:
             COOKIE_SECURE=true
 
       - if: steps.check.outputs.mode != 'skip'
-        run: echo "Deployed Cloud Run service URL: ${{ steps.deploy.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          echo "Deployed Cloud Run service URL: ${{ steps.deploy.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
