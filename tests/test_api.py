@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from urllib.parse import parse_qs, unquote, urlsplit
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
@@ -27,6 +28,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app import auth as auth_mod
 from app.db import get_db, normalize_db_url
 from app.main import app
 from app.models import Base, UserStorage
@@ -331,9 +333,50 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
         alembic_cfg = AlembicConfig(str(BACKEND_DIR / "alembic.ini"))
         alembic_cfg.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
         script = ScriptDirectory.from_config(alembic_cfg)
-        self.assertEqual(script.get_heads(), ["0002"])
+        self.assertEqual(script.get_heads(), ["0003"])
         self.assertEqual(resolve_region("https://s3.us-west-004.backblazeb2.com", "auto"), "us-west-004")
         self.assertEqual(resolve_region("", "auto"), "us-east-1")
+
+    def test_brevo_otp_email(self):
+        captured = {}
+
+        class FakeResponse:
+            status = 201
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(req, timeout=0):
+            captured["url"] = req.full_url
+            captured["headers"] = {k.lower(): v for k, v in req.header_items()}
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        prev = {k: os.environ.get(k) for k in ("BREVO_API_KEY", "BREVO_SENDER_EMAIL", "BREVO_SENDER_NAME")}
+        os.environ["BREVO_API_KEY"] = "xkeysib-test-key"
+        os.environ["BREVO_SENDER_EMAIL"] = "noreply@example.com"
+        os.environ["BREVO_SENDER_NAME"] = "HTML Notebook"
+        try:
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                auth_mod.send_otp_email("reader@example.com", "482910")
+        finally:
+            for k, v in prev.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        self.assertEqual(captured["url"], "https://api.brevo.com/v3/smtp/email")
+        self.assertEqual(captured["headers"]["api-key"], "xkeysib-test-key")
+        self.assertEqual(captured["body"]["sender"], {"name": "HTML Notebook", "email": "noreply@example.com"})
+        self.assertEqual(captured["body"]["to"], [{"email": "reader@example.com"}])
+        self.assertIn("482910", captured["body"]["subject"])
+        self.assertIn("482910", captured["body"]["htmlContent"])
+        self.assertIn("482910", captured["body"]["textContent"])
 
     def test_ssrf_validation(self):
         os.environ["ALLOW_INSECURE_S3"] = "false"
@@ -351,136 +394,166 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
             os.environ["ALLOW_INSECURE_S3"] = "true"
 
     async def test_multi_tenant_s3_crud_and_allowed_origins(self):
-        user_a = AsgiClient(app)
-        s, _, d = await user_a.request("GET", "/api/auth/me")
-        self.assertEqual(s, 200)
-        self.assertEqual(d, {"user": None})
+        sent_otps: dict[str, str] = {}
 
-        s, _, d = await user_a.request(
-            "POST",
-            "/api/auth/signup",
-            {"email": "a@example.com", "password": "password123"},
-            origin="https://evil.example.com",
-        )
-        self.assertEqual(s, 403)
+        def capture_otp(email: str, code: str) -> None:
+            sent_otps[email] = code
 
-        s, _, d = await user_a.request(
-            "POST",
-            "/api/auth/signup",
-            {"email": "a@example.com", "password": "password123"},
-            origin="https://htmlnote-web.vercel.app",
-        )
-        self.assertEqual(s, 200)
-        user_a_id = d["user"]["id"]
+        with patch("app.auth.send_otp_email", side_effect=capture_otp):
+            user_a = AsgiClient(app)
+            s, _, d = await user_a.request("GET", "/api/auth/me")
+            self.assertEqual(s, 200)
+            self.assertEqual(d, {"user": None})
 
-        s, _, d = await user_a.request("GET", "/api/storage")
-        self.assertEqual(s, 200)
-        self.assertFalse(d["configured"])
-        s, _, _ = await user_a.request("GET", "/api/tree")
-        self.assertEqual(s, 400)
+            s, _, d = await user_a.request(
+                "POST",
+                "/api/auth/signup",
+                {"email": "a@example.com", "password": "password123"},
+                origin="https://evil.example.com",
+            )
+            self.assertEqual(s, 403)
 
-        bad_payload = {
-            "endpointUrl": self.endpoint,
-            "region": "auto",
-            "bucket": "missing-bucket",
-            "accessKeyId": "AKIA",
-            "secretAccessKey": "SECRET_A",
-            "prefix": "user-a",
-            "forcePathStyle": True,
-        }
-        s, _, _ = await user_a.request("POST", "/api/storage/test", bad_payload)
-        self.assertEqual(s, 400)
+            s, _, d = await user_a.request(
+                "POST",
+                "/api/auth/signup",
+                {"email": "a@example.com", "password": "password123"},
+                origin="https://htmlnote-web.vercel.app",
+            )
+            self.assertEqual((s, d), (200, {"otpRequired": True, "email": "a@example.com"}))
+            code_a = sent_otps["a@example.com"]
+            bad_code = "000000" if code_a != "000000" else "111111"
 
-        payload_a = {
-            "endpointUrl": self.endpoint,
-            "region": "auto",
-            "bucket": "test-bucket",
-            "accessKeyId": "AKIA_A",
-            "secretAccessKey": "SECRET_RAW_A",
-            "prefix": "user-a",
-            "forcePathStyle": True,
-        }
-        s, _, d = await user_a.request("POST", "/api/storage/test", payload_a)
-        self.assertEqual((s, d), (200, {"ok": True}))
-        s, _, d = await user_a.request("PUT", "/api/storage", payload_a)
-        self.assertEqual(s, 200)
-        self.assertTrue(d["configured"])
-        self.assertTrue(d["hasSecretKey"])
-        self.assertNotIn("secretAccessKey", d)
+            s, _, _ = await user_a.request(
+                "POST",
+                "/api/auth/verify-signup",
+                {"email": "a@example.com", "code": bad_code},
+                origin="https://htmlnote-web.vercel.app",
+            )
+            self.assertEqual(s, 401)
 
-        with self.SessionLocal() as db:
-            row = db.get(UserStorage, user_a_id)
-            self.assertIsNotNone(row)
-            self.assertNotEqual(row.secret_key_enc, "SECRET_RAW_A")
+            s, _, d = await user_a.request(
+                "POST",
+                "/api/auth/verify-signup",
+                {"email": "a@example.com", "code": code_a},
+                origin="https://htmlnote-web.vercel.app",
+            )
+            self.assertEqual(s, 200)
+            user_a_id = d["user"]["id"]
 
-        s, _, d = await user_a.request("PUT", "/api/storage", {**payload_a, "secretAccessKey": "", "prefix": "tenant-a"})
-        self.assertEqual(s, 200)
-        self.assertEqual(d["prefix"], "tenant-a")
+            s, _, d = await user_a.request("GET", "/api/storage")
+            self.assertEqual(s, 200)
+            self.assertFalse(d["configured"])
+            s, _, _ = await user_a.request("GET", "/api/tree")
+            self.assertEqual(s, 400)
 
-        s, _, nb = await user_a.request("POST", "/api/folder", {"parent": "", "name": "Work"})
-        self.assertEqual((s, nb), (200, {"path": "Work"}))
-        s, _, sec = await user_a.request("POST", "/api/folder", {"parent": "Work", "name": "Notes"})
-        self.assertEqual((s, sec), (200, {"path": "Work/Notes"}))
-        s, _, pg = await user_a.request("POST", "/api/page", {"section": "Work/Notes", "name": "First", "html": "<h1>Hello</h1>"})
-        self.assertEqual((s, pg), (200, {"path": "Work/Notes/First.html"}))
+            bad_payload = {
+                "endpointUrl": self.endpoint,
+                "region": "auto",
+                "bucket": "missing-bucket",
+                "accessKeyId": "AKIA",
+                "secretAccessKey": "SECRET_A",
+                "prefix": "user-a",
+                "forcePathStyle": True,
+            }
+            s, _, _ = await user_a.request("POST", "/api/storage/test", bad_payload)
+            self.assertEqual(s, 400)
 
-        s, _, d = await user_a.request("PUT", "/api/page?path=Work/Notes/First.html", {"html": "<h1>Updated</h1>", "keepVersion": True})
-        self.assertEqual((s, d), (200, {"saved": True}))
-        s, _, vers = await user_a.request("GET", "/api/versions?path=Work/Notes/First.html")
-        self.assertEqual(s, 200)
-        self.assertEqual(len(vers), 1)
-        s, _, ver = await user_a.request("GET", f"/api/version?path=Work/Notes/First.html&id={vers[0]['id']}")
-        self.assertEqual((s, ver["html"]), (200, "<h1>Hello</h1>"))
+            payload_a = {
+                "endpointUrl": self.endpoint,
+                "region": "auto",
+                "bucket": "test-bucket",
+                "accessKeyId": "AKIA_A",
+                "secretAccessKey": "SECRET_RAW_A",
+                "prefix": "user-a",
+                "forcePathStyle": True,
+            }
+            s, _, d = await user_a.request("POST", "/api/storage/test", payload_a)
+            self.assertEqual((s, d), (200, {"ok": True}))
+            s, _, d = await user_a.request("PUT", "/api/storage", payload_a)
+            self.assertEqual(s, 200)
+            self.assertTrue(d["configured"])
+            self.assertTrue(d["hasSecretKey"])
+            self.assertNotIn("secretAccessKey", d)
 
-        s, hdrs, body = await user_a.request("GET", "/page/Work/Notes/First.html")
-        self.assertEqual(s, 200)
-        self.assertEqual(body, "<h1>Updated</h1>")
-        self.assertIn("script-src 'none'", hdrs["content-security-policy"])
-        s, hdrs, body = await user_a.request("GET", "/view/Work/Notes/First.html")
-        self.assertEqual(s, 200)
-        self.assertIn("sandbox", hdrs["content-security-policy"])
+            with self.SessionLocal() as db:
+                row = db.get(UserStorage, user_a_id)
+                self.assertIsNotNone(row)
+                self.assertNotEqual(row.secret_key_enc, "SECRET_RAW_A")
 
-        s, _, d = await user_a.request("POST", "/api/rename", {"path": "Work/Notes/First.html", "name": "Renamed"})
-        self.assertEqual((s, d), (200, {"path": "Work/Notes/Renamed.html"}))
-        s, _, vers = await user_a.request("GET", "/api/versions?path=Work/Notes/Renamed.html")
-        self.assertEqual((s, len(vers)), (200, 1))
-        s, _, d = await user_a.request("POST", "/api/rename", {"path": "Work/Notes", "name": "Docs"})
-        self.assertEqual((s, d), (200, {"path": "Work/Docs"}))
-        s, _, d = await user_a.request("POST", "/api/rename", {"path": "Work", "name": "Projects"})
-        self.assertEqual((s, d), (200, {"path": "Projects"}))
+            s, _, d = await user_a.request("PUT", "/api/storage", {**payload_a, "secretAccessKey": "", "prefix": "tenant-a"})
+            self.assertEqual(s, 200)
+            self.assertEqual(d["prefix"], "tenant-a")
 
-        with LOCK:
-            BUCKETS["test-bucket"]["tenant-a/AgentNB/Sec/note.html"] = (b"<h1>From Agent</h1>", time.time() + 2, "text/html")
+            s, _, nb = await user_a.request("POST", "/api/folder", {"parent": "", "name": "Work"})
+            self.assertEqual((s, nb), (200, {"path": "Work"}))
+            s, _, sec = await user_a.request("POST", "/api/folder", {"parent": "Work", "name": "Notes"})
+            self.assertEqual((s, sec), (200, {"path": "Work/Notes"}))
+            s, _, pg = await user_a.request("POST", "/api/page", {"section": "Work/Notes", "name": "First", "html": "<h1>Hello</h1>"})
+            self.assertEqual((s, pg), (200, {"path": "Work/Notes/First.html"}))
 
-        s, _, tree = await user_a.request("GET", "/api/tree")
-        self.assertEqual(s, 200)
-        self.assertEqual([n["name"] for n in tree], ["Projects", "AgentNB"])
-        self.assertEqual(tree[1]["sections"][0]["pages"], [{"name": "note", "path": "AgentNB/Sec/note.html"}])
+            s, _, d = await user_a.request("PUT", "/api/page?path=Work/Notes/First.html", {"html": "<h1>Updated</h1>", "keepVersion": True})
+            self.assertEqual((s, d), (200, {"saved": True}))
+            s, _, d = await user_a.request("PUT", "/api/page?path=Work/Notes/First.html", {"html": "<h1>Updated Fast</h1>", "keepVersion": False})
+            self.assertEqual((s, d), (200, {"saved": True}))
+            s, _, d = await user_a.request("PUT", "/api/page?path=Work/Notes/First.html", {"html": "<h1>Updated</h1>", "keepVersion": False})
+            self.assertEqual((s, d), (200, {"saved": True}))
+            s, _, vers = await user_a.request("GET", "/api/versions?path=Work/Notes/First.html")
+            self.assertEqual(s, 200)
+            self.assertEqual(len(vers), 1)
+            s, _, ver = await user_a.request("GET", f"/api/version?path=Work/Notes/First.html&id={vers[0]['id']}")
+            self.assertEqual((s, ver["html"]), (200, "<h1>Hello</h1>"))
 
-        s, _, _ = await user_a.request("DELETE", "/api/item?path=AgentNB/Sec/note.html")
-        self.assertEqual(s, 200)
-        s, _, tree = await user_a.request("GET", "/api/tree")
-        agent_nb = next((n for n in tree if n["name"] == "AgentNB"), None)
-        self.assertEqual(s, 200)
-        self.assertIsNotNone(agent_nb)
-        self.assertEqual(agent_nb["sections"][0], {"name": "Sec", "path": "AgentNB/Sec", "pages": []})
+            s, hdrs, body = await user_a.request("GET", "/page/Work/Notes/First.html")
+            self.assertEqual(s, 200)
+            self.assertEqual(body, "<h1>Updated</h1>")
+            self.assertIn("script-src 'none'", hdrs["content-security-policy"])
+            s, hdrs, body = await user_a.request("GET", "/view/Work/Notes/First.html")
+            self.assertEqual(s, 200)
+            self.assertIn("sandbox", hdrs["content-security-policy"])
 
-        user_b = AsgiClient(app)
-        await user_b.request("GET", "/api/auth/me")
-        s, _, _ = await user_b.request("POST", "/api/auth/signup", {"email": "b@example.com", "password": "password123"})
-        self.assertEqual(s, 200)
-        s, _, d = await user_b.request("GET", "/api/storage")
-        self.assertFalse(d["configured"])
-        s, _, _ = await user_b.request("PUT", "/api/storage", {**payload_a, "bucket": "other-bucket", "prefix": "tenant-b", "secretAccessKey": "SECRET_B"})
-        self.assertEqual(s, 200)
-        s, _, tree_b = await user_b.request("GET", "/api/tree")
-        self.assertEqual((s, tree_b), (200, []))
+            s, _, d = await user_a.request("POST", "/api/rename", {"path": "Work/Notes/First.html", "name": "Renamed"})
+            self.assertEqual((s, d), (200, {"path": "Work/Notes/Renamed.html"}))
+            s, _, vers = await user_a.request("GET", "/api/versions?path=Work/Notes/Renamed.html")
+            self.assertEqual((s, len(vers)), (200, 1))
+            s, _, d = await user_a.request("POST", "/api/rename", {"path": "Work/Notes", "name": "Docs"})
+            self.assertEqual((s, d), (200, {"path": "Work/Docs"}))
+            s, _, d = await user_a.request("POST", "/api/rename", {"path": "Work", "name": "Projects"})
+            self.assertEqual((s, d), (200, {"path": "Projects"}))
 
-        s, _, d = await user_a.request("DELETE", "/api/storage")
-        self.assertEqual(s, 200)
-        self.assertFalse(d["configured"])
-        s, _, _ = await user_a.request("GET", "/api/tree")
-        self.assertEqual(s, 400)
+            with LOCK:
+                BUCKETS["test-bucket"]["tenant-a/AgentNB/Sec/note.html"] = (b"<h1>From Agent</h1>", time.time() + 2, "text/html")
+
+            s, _, tree = await user_a.request("GET", "/api/tree")
+            self.assertEqual(s, 200)
+            self.assertEqual([n["name"] for n in tree], ["Projects", "AgentNB"])
+            self.assertEqual(tree[1]["sections"][0]["pages"], [{"name": "note", "path": "AgentNB/Sec/note.html"}])
+
+            s, _, _ = await user_a.request("DELETE", "/api/item?path=AgentNB/Sec/note.html")
+            self.assertEqual(s, 200)
+            s, _, tree = await user_a.request("GET", "/api/tree")
+            agent_nb = next((n for n in tree if n["name"] == "AgentNB"), None)
+            self.assertEqual(s, 200)
+            self.assertIsNotNone(agent_nb)
+            self.assertEqual(agent_nb["sections"][0], {"name": "Sec", "path": "AgentNB/Sec", "pages": []})
+
+            user_b = AsgiClient(app)
+            await user_b.request("GET", "/api/auth/me")
+            s, _, _ = await user_b.request("POST", "/api/auth/signup", {"email": "b@example.com", "password": "password123"})
+            self.assertEqual(s, 200)
+            s, _, _ = await user_b.request("POST", "/api/auth/verify-signup", {"email": "b@example.com", "code": sent_otps["b@example.com"]})
+            self.assertEqual(s, 200)
+            s, _, d = await user_b.request("GET", "/api/storage")
+            self.assertFalse(d["configured"])
+            s, _, _ = await user_b.request("PUT", "/api/storage", {**payload_a, "bucket": "other-bucket", "prefix": "tenant-b", "secretAccessKey": "SECRET_B"})
+            self.assertEqual(s, 200)
+            s, _, tree_b = await user_b.request("GET", "/api/tree")
+            self.assertEqual((s, tree_b), (200, []))
+
+            s, _, d = await user_a.request("DELETE", "/api/storage")
+            self.assertEqual(s, 200)
+            self.assertFalse(d["configured"])
+            s, _, _ = await user_a.request("GET", "/api/tree")
+            self.assertEqual(s, 400)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,10 @@
+from collections import OrderedDict
+import hashlib
 import ipaddress
 import os
 import re
 import socket
+import threading
 import time
 from urllib.parse import urlsplit
 
@@ -14,6 +17,11 @@ VERSION_GAP_MS = 5 * 60 * 1000
 PAGE_EXT = re.compile(r"\.html?$", re.IGNORECASE)
 VERSION_ID = re.compile(r"^\d+\.html$")
 BAD_CHARS = re.compile(r'[/\\:*?"<>|\x00-\x1f]')
+
+_CACHE_LOCK = threading.Lock()
+_ENDPOINT_CACHE: OrderedDict[tuple[str, bool], str] = OrderedDict()
+_CLIENT_CACHE: OrderedDict[tuple[str, str, str, str, bool], object] = OrderedDict()
+_LAST_SNAPSHOT: OrderedDict[tuple[str, str, str], int] = OrderedDict()
 
 
 class StoreError(Exception):
@@ -28,6 +36,12 @@ def validate_endpoint(endpoint_url: str) -> str:
     if not cleaned:
         return ""
     allow_insecure = os.environ.get("ALLOW_INSECURE_S3", "false").lower() == "true"
+    cache_key = (cleaned, allow_insecure)
+    with _CACHE_LOCK:
+        cached = _ENDPOINT_CACHE.get(cache_key)
+        if cached is not None:
+            _ENDPOINT_CACHE.move_to_end(cache_key)
+            return cached
     u = urlsplit(cleaned)
     allowed = ("https", "http") if allow_insecure else ("https",)
     if u.scheme.lower() not in allowed:
@@ -46,7 +60,60 @@ def validate_endpoint(endpoint_url: str) -> str:
             target = getattr(ip, "ipv4_mapped", None) or ip
             if not target.is_global:
                 raise StoreError(400, "Private or internal endpoint addresses are not allowed")
-    return f"{u.scheme.lower()}://{u.netloc}"
+    normalized = f"{u.scheme.lower()}://{u.netloc}"
+    with _CACHE_LOCK:
+        _ENDPOINT_CACHE[cache_key] = normalized
+        if len(_ENDPOINT_CACHE) > 256:
+            _ENDPOINT_CACHE.popitem(last=False)
+    return normalized
+
+
+def _get_client(endpoint_url: str, region: str, access_key_id: str, secret_access_key: str, force_path_style: bool):
+    secret_digest = hashlib.sha256(secret_access_key.encode("utf-8")).hexdigest()
+    key = (endpoint_url, region, access_key_id, secret_digest, bool(force_path_style))
+    with _CACHE_LOCK:
+        cached = _CLIENT_CACHE.get(key)
+        if cached is not None:
+            _CLIENT_CACHE.move_to_end(key)
+            return cached
+    cfg = Config(
+        region_name=region,
+        signature_version="s3v4",
+        request_checksum_calculation="when_required",
+        response_checksum_validation="when_required",
+        connect_timeout=5,
+        read_timeout=15,
+        max_pool_connections=16,
+        retries={"max_attempts": 2, "mode": "standard"},
+        s3={"addressing_style": "path" if force_path_style else "auto"},
+    )
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint_url or None,
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=secret_access_key,
+        region_name=region,
+        config=cfg,
+    )
+    with _CACHE_LOCK:
+        _CLIENT_CACHE[key] = client
+        if len(_CLIENT_CACHE) > 64:
+            _CLIENT_CACHE.popitem(last=False)
+    return client
+
+
+def _evict_snapshot(endpoint_url: str, bucket: str, key_or_prefix: str, is_prefix: bool = False) -> None:
+    with _CACHE_LOCK:
+        if not is_prefix:
+            _LAST_SNAPSHOT.pop((endpoint_url, bucket, key_or_prefix), None)
+            return
+        victims = [
+            k
+            for k in _LAST_SNAPSHOT
+            if k[0] == endpoint_url and k[1] == bucket and k[2].startswith(key_or_prefix)
+        ]
+        for k in victims:
+            _LAST_SNAPSHOT.pop(k, None)
 
 
 def clean_prefix(prefix: str | None) -> str:
@@ -72,24 +139,7 @@ class Store:
         self.bucket = (bucket or "").strip()
         cleaned = clean_prefix(prefix)
         self.base_prefix = f"{cleaned}/" if cleaned else ""
-        cfg = Config(
-            region_name=self.region,
-            signature_version="s3v4",
-            request_checksum_calculation="when_required",
-            response_checksum_validation="when_required",
-            connect_timeout=5,
-            read_timeout=15,
-            retries={"max_attempts": 2, "mode": "standard"},
-            s3={"addressing_style": "path" if force_path_style else "auto"},
-        )
-        self.client = boto3.client(
-            "s3",
-            endpoint_url=self.endpoint_url or None,
-            aws_access_key_id=access_key_id,
-            aws_secret_access_key=secret_access_key,
-            region_name=self.region,
-            config=cfg,
-        )
+        self.client = _get_client(self.endpoint_url, self.region, access_key_id, secret_access_key, force_path_style)
 
     def _call(self, fn, *args, **kwargs):
         try:
@@ -339,10 +389,25 @@ class Store:
     def write_page(self, rel: str, html: str, keep_version: bool) -> dict:
         clean = self.page_rel(rel)
         key = self.full_key(clean)
+        snap_key = (self.endpoint_url, self.bucket, key)
+        now = self.now_ms()
+        if not keep_version:
+            with _CACHE_LOCK:
+                last = _LAST_SNAPSHOT.get(snap_key)
+                if last is not None:
+                    _LAST_SNAPSHOT.move_to_end(snap_key)
+            if last is not None and now - last < VERSION_GAP_MS:
+                self._put_text(key, html)
+                return {"saved": True}
         prev = self._get_text(key)
         if prev == html:
             return {"saved": False}
         self.snapshot(clean, prev, keep_version)
+        with _CACHE_LOCK:
+            _LAST_SNAPSHOT[snap_key] = now
+            _LAST_SNAPSHOT.move_to_end(snap_key)
+            if len(_LAST_SNAPSHOT) > 2048:
+                _LAST_SNAPSHOT.popitem(last=False)
         self._put_text(key, html)
         return {"saved": True}
 
@@ -408,6 +473,7 @@ class Store:
             for obj in ver_objs:
                 self._copy_key(obj["Key"], new_ver_prefix + obj["Key"][len(old_ver_prefix) :])
             self._delete_keys([src_key, *(o["Key"] for o in ver_objs)])
+            _evict_snapshot(self.endpoint_url, self.bucket, src_key)
             return {"path": dst_rel}
         if len(parts) not in (1, 2):
             raise StoreError(400, "Invalid path")
@@ -429,6 +495,7 @@ class Store:
         for obj in ver_objs:
             self._copy_key(obj["Key"], new_ver_prefix + obj["Key"][len(old_ver_prefix) :])
         self._delete_keys([*(o["Key"] for o in old_objs), *(o["Key"] for o in ver_objs)])
+        _evict_snapshot(self.endpoint_url, self.bucket, old_prefix, is_prefix=True)
         return {"path": dst_rel}
 
     def remove(self, rel: str) -> dict:
@@ -442,6 +509,7 @@ class Store:
                 raise FileNotFoundError()
             ver_objs = self._list(f".versions/{src_rel}/")
             self._delete_keys([src_key, *(o["Key"] for o in ver_objs)])
+            _evict_snapshot(self.endpoint_url, self.bucket, src_key)
             sec_rel = f"{parts[0]}/{parts[1]}"
             if not self._list_one(f"{sec_rel}/"):
                 self._put_keep(sec_rel)
@@ -453,6 +521,7 @@ class Store:
             raise FileNotFoundError()
         ver_objs = self._list(f".versions/{src_rel}/")
         self._delete_keys([*(o["Key"] for o in old_objs), *(o["Key"] for o in ver_objs)])
+        _evict_snapshot(self.endpoint_url, self.bucket, self.full_key(f"{src_rel}/"), is_prefix=True)
         if len(parts) == 2 and not self._list_one(f"{parts[0]}/"):
             self._put_keep(parts[0])
         return {"removed": True}

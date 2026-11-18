@@ -16,7 +16,7 @@ DATABASE_URL = normalize_db_url(
     os.environ.get("DATABASE_URL", "postgresql+psycopg://htmlnote:htmlnote@127.0.0.1:5432/htmlnote")
 )
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=10, pool_recycle=300)
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
 
 

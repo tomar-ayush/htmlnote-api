@@ -79,7 +79,8 @@ External agents or automation scripts only need to upload `[S3_PREFIX/]<notebook
 |---|---|---|
 | `GET` | `/healthz` | Container health probe (`{"ok": true}`) |
 | `GET` | `/api/auth/me` | Return active user & issue CSRF cookie |
-| `POST` | `/api/auth/signup` | Create user account and start session |
+| `POST` | `/api/auth/signup` | Validate signup details and send 6-digit email OTP via Brevo |
+| `POST` | `/api/auth/verify-signup` | Verify 6-digit OTP, create user account, and start session |
 | `POST` | `/api/auth/login` | Authenticate user with rate-limiting |
 | `POST` | `/api/auth/logout` | Revoke session and clear cookie |
 | `GET` | `/api/storage` | Get masked S3 configuration for current user |
@@ -138,6 +139,9 @@ Configure these 3 variables directly in Cloud Run (**Variables & Secrets**):
 | `DATABASE_URL` | Yes | — | Neon Postgres connection string (`postgresql://...` and `postgres://...` are normalized automatically to `postgresql+psycopg://`) |
 | `SECRET_KEY` | Yes | — | Random secret used to Fernet-encrypt per-user S3 secret keys in Neon (`openssl rand -hex 32`) |
 | `ALLOWED_ORIGINS` | Yes (with Vercel) | `""` | Comma-separated Vercel origins or wildcard patterns allowed to send proxied write requests (e.g. `https://htmlnote-web.vercel.app,https://htmlnote-web-*.vercel.app`) |
+| `BREVO_API_KEY` | Yes (Production) | `""` | Brevo transactional API key (`xkeysib-...`) for sending signup OTP verification emails |
+| `BREVO_SENDER_EMAIL` | Yes (Production) | `""` | Verified sender email address in your Brevo account |
+| `BREVO_SENDER_NAME` | Optional | `HTML Notebook` | Display name used on signup verification emails |
 | `COOKIE_SECURE` | Production | `true` (in `Dockerfile`) | Enables `__Host-` cookie prefix and `Secure` attribute |
 | `ALLOWED_HOSTS` | Optional | `*` (in `Dockerfile`) | Comma-separated allowed `Host` headers |
 | `ALLOW_INSECURE_S3` | Optional | `false` | Set `true` only for plain-HTTP local/private S3 servers |
