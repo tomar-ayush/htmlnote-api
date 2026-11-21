@@ -92,6 +92,7 @@ External agents or automation scripts only need to upload `[S3_PREFIX/]<notebook
 | `POST` | `/api/page` | Create `.html` page inside a section |
 | `PUT` | `/api/page?path=...` | Update page HTML and optionally force version snapshot |
 | `POST` | `/api/rename` | Rename notebook, section, or page (including versions) |
+| `POST` | `/api/reorder` | Persist user ordering for notebooks, sections, or pages |
 | `DELETE` | `/api/item?path=...` | Delete notebook, section, or page (preserving parent markers) |
 | `GET` | `/api/versions?path=...` | List up to 10 saved page versions |
 | `GET` | `/api/version?path=...&id=...` | Fetch HTML for a specific saved version |

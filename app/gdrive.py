@@ -8,17 +8,35 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from . import auth, storage
 from .db import get_db
 from .models import User, UserGoogleDrive
-from .store import BAD_CHARS, MAX_VERSIONS, PAGE_EXT, VERSION_GAP_MS, VERSION_ID, StoreError, sync_html_title
+from .store import (
+    BAD_CHARS,
+    MAX_VERSIONS,
+    PAGE_EXT,
+    VERSION_GAP_MS,
+    VERSION_ID,
+    StoreError,
+    apply_order,
+    empty_order,
+    order_append_folder,
+    order_append_page,
+    order_remove,
+    order_rename,
+    order_set,
+    parse_order,
+    sync_html_title,
+)
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 ROOT_FOLDER_NAME = "HTML Notebook"
@@ -27,6 +45,7 @@ _SNAP_LOCK = threading.Lock()
 _LAST_DRIVE_SNAPSHOT: OrderedDict[tuple[str, str], int] = OrderedDict()
 
 router = APIRouter(prefix="/api/drive", tags=["drive"])
+OAUTH_LOGIN_COOKIE = f"{auth.COOKIE_PREFIX}hn_oauth"
 
 
 class ProviderIn(BaseModel):
@@ -341,32 +360,87 @@ class DriveStore:
         by_parent = self._list_all()
         return self._resolve_chain(by_parent, parts, leaf_is_folder=False) is not None
 
+    def _read_order(self, by_parent: dict[str, list[dict]]) -> tuple[dict | None, dict]:
+        node = self._find_child(by_parent, self.root_folder_id, ".order.json", want_folder=False)
+        if not node:
+            return None, empty_order()
+        try:
+            return node, parse_order(self._download_text(node["id"]))
+        except FileNotFoundError:
+            return None, empty_order()
+
+    def _write_order(self, node: dict | None, order: dict) -> None:
+        raw = json.dumps(order, separators=(",", ":")).encode("utf-8")
+        if node:
+            headers = self._headers({"Content-Type": "application/json; charset=UTF-8"})
+            _request_json(
+                "PATCH",
+                f"{_drive_upload_base()}/files/{node['id']}?uploadType=media&fields=id,name",
+                headers=headers,
+                data=raw,
+            )
+            return
+        boundary = f"hn_{secrets.token_hex(12)}"
+        meta = {"name": ".order.json", "mimeType": "application/json", "parents": [self.root_folder_id]}
+        body = (
+            f"--{boundary}\r\n"
+            f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+            f"{json.dumps(meta)}\r\n"
+            f"--{boundary}\r\n"
+            f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+        ).encode("utf-8") + raw + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        headers = self._headers({"Content-Type": f"multipart/related; boundary={boundary}"})
+        _request_json(
+            "POST",
+            f"{_drive_upload_base()}/files?uploadType=multipart&fields=id,name",
+            headers=headers,
+            data=body,
+        )
+
     def tree(self) -> list[dict]:
         by_parent = self._list_all()
-        notebooks = [
-            item
-            for item in by_parent.get(self.root_folder_id, [])
-            if item.get("mimeType") == FOLDER_MIME and not item["name"].startswith(".")
-        ]
-        notebooks.sort(key=lambda item: (_ts(item.get("createdTime")), item["name"].lower()))
+        _, order = self._read_order(by_parent)
+        notebooks = apply_order(
+            [
+                item
+                for item in by_parent.get(self.root_folder_id, [])
+                if item.get("mimeType") == FOLDER_MIME and not item["name"].startswith(".")
+            ],
+            lambda item: item["name"],
+            order["notebooks"],
+            lambda item: (_ts(item.get("createdTime")), item["name"].lower()),
+        )
         out: list[dict] = []
         for nb in notebooks:
-            secs = [
-                item
-                for item in by_parent.get(nb["id"], [])
-                if item.get("mimeType") == FOLDER_MIME and not item["name"].startswith(".")
-            ]
-            secs.sort(key=lambda item: (_ts(item.get("createdTime")), item["name"].lower()))
+            secs = apply_order(
+                [
+                    item
+                    for item in by_parent.get(nb["id"], [])
+                    if item.get("mimeType") == FOLDER_MIME and not item["name"].startswith(".")
+                ],
+                lambda item: item["name"],
+                order["sections"].get(nb["name"], []),
+                lambda item: (_ts(item.get("createdTime")), item["name"].lower()),
+            )
             sections = []
             for sec in secs:
-                pages = [
-                    {"name": PAGE_EXT.sub("", item["name"]), "path": f"{nb['name']}/{sec['name']}/{item['name']}"}
+                raw_pages = [
+                    item
                     for item in by_parent.get(sec["id"], [])
                     if item.get("mimeType") != FOLDER_MIME
                     and not item["name"].startswith(".")
                     and PAGE_EXT.search(item["name"])
                 ]
-                pages.sort(key=lambda p: p["name"].lower())
+                ordered_pages = apply_order(
+                    raw_pages,
+                    lambda item: item["name"],
+                    order["pages"].get(f"{nb['name']}/{sec['name']}", []),
+                    lambda item: (_ts(item.get("createdTime")), item["name"].lower()),
+                )
+                pages = [
+                    {"name": PAGE_EXT.sub("", item["name"]), "path": f"{nb['name']}/{sec['name']}/{item['name']}"}
+                    for item in ordered_pages
+                ]
                 sections.append({"name": sec["name"], "path": f"{nb['name']}/{sec['name']}", "pages": pages})
             out.append({"name": nb["name"], "path": nb["name"], "sections": sections})
         return out
@@ -390,6 +464,9 @@ class DriveStore:
             candidate = f"{base} {i}"
             i += 1
         self._create_dir(parent_id, candidate)
+        order_node, order = self._read_order(by_parent)
+        order_append_folder(order, parts, candidate)
+        self._write_order(order_node, order)
         rel = f"{parts[0]}/{candidate}" if parts else candidate
         return {"path": rel}
 
@@ -412,7 +489,11 @@ class DriveStore:
         stem = PAGE_EXT.sub("", filename)
         content = sync_html_title(html, stem)
         self._upload_multipart({"name": filename, "mimeType": "text/html", "parents": [sec_node["id"]]}, content)
-        return {"path": f"{parts[0]}/{parts[1]}/{filename}"}
+        sec_rel = f"{parts[0]}/{parts[1]}"
+        order_node, order = self._read_order(by_parent)
+        order_append_page(order, sec_rel, filename)
+        self._write_order(order_node, order)
+        return {"path": f"{sec_rel}/{filename}"}
 
     def read_page(self, rel: str) -> str:
         parts = self.split_rel(self.page_rel(rel))
@@ -530,6 +611,9 @@ class DriveStore:
             if ver_node:
                 self._api_json("PATCH", f"/files/{ver_node['id']}", {"name": new_leaf})
             _evict_drive_snapshot(self.root_folder_id, src_rel)
+            order_node, order = self._read_order(by_parent)
+            order_rename(order, parts, new_leaf)
+            self._write_order(order_node, order)
             return {"path": dst_rel}
         new_leaf = self.clean_name(name)
         dst_rel = "/".join([*parts[:-1], new_leaf])
@@ -542,6 +626,9 @@ class DriveStore:
         if ver_node:
             self._api_json("PATCH", f"/files/{ver_node['id']}", {"name": new_leaf})
         _evict_drive_snapshot(self.root_folder_id, src_rel, is_prefix=True)
+        order_node, order = self._read_order(by_parent)
+        order_rename(order, parts, new_leaf)
+        self._write_order(order_node, order)
         return {"path": dst_rel}
 
     def remove(self, rel: str) -> dict:
@@ -561,7 +648,17 @@ class DriveStore:
         if ver_node:
             self._api_json("DELETE", f"/files/{ver_node['id']}")
         _evict_drive_snapshot(self.root_folder_id, src_rel, is_prefix=not is_page)
+        order_node, order = self._read_order(by_parent)
+        order_remove(order, parts)
+        self._write_order(order_node, order)
         return {"removed": True}
+
+    def reorder(self, kind: str, parent: str, items: list[str]) -> dict:
+        by_parent = self._list_all()
+        order_node, order = self._read_order(by_parent)
+        order_set(order, kind, parent, items, self.split_rel)
+        self._write_order(order_node, order)
+        return {"ok": True}
 
 
 def drive_store_for_user(user_id: str, db: Session) -> DriveStore:
@@ -592,25 +689,67 @@ def drive_auth_url(request: Request, user: User = Depends(auth.current_user)):
     return {"url": f"{_auth_url()}?{params}"}
 
 
+def _google_login_user(access_token: str, db: Session) -> User:
+    uinfo = _request_json("GET", _userinfo_url(), headers={"Authorization": f"Bearer {access_token}"})
+    if uinfo.get("verified_email") is not True:
+        raise StoreError(400, "Your Google account email is not verified")
+    email = auth.clean_email(str(uinfo.get("email") or ""))
+    user = db.scalar(select(User).where(User.email == email))
+    if not user:
+        user = User(id=uuid.uuid4().hex, email=email, password_hash=auth.hash_password(secrets.token_hex(32)))
+        db.add(user)
+        db.flush()
+    return user
+
+
+@router.get("/login")
+def drive_login(request: Request):
+    if not drive_oauth_available():
+        return RedirectResponse(
+            f"/?drive_error={urllib.parse.quote_plus('Google sign-in is not configured on the server')}", status_code=302
+        )
+    nonce = secrets.token_urlsafe(16)
+    params = urllib.parse.urlencode(
+        {
+            "client_id": google_client_id(),
+            "redirect_uri": resolve_redirect_uri(request),
+            "response_type": "code",
+            "scope": DRIVE_SCOPES,
+            "access_type": "offline",
+            "prompt": "consent",
+            "state": make_oauth_state(f"login:{nonce}"),
+        }
+    )
+    response = RedirectResponse(f"{_auth_url()}?{params}", status_code=302)
+    response.set_cookie(
+        OAUTH_LOGIN_COOKIE, nonce, max_age=600, path="/", secure=auth.COOKIE_SECURE, httponly=True, samesite="lax"
+    )
+    return response
+
+
 @router.get("/callback")
 def drive_callback(request: Request, code: str = "", state: str = "", error: str = "", db: Session = Depends(get_db)):
     def fail(msg: str) -> RedirectResponse:
         return RedirectResponse(f"/?drive_error={urllib.parse.quote_plus(msg)}", status_code=302)
 
-    user = auth.optional_user(request, db)
-    if not user:
+    login_nonce = request.cookies.get(OAUTH_LOGIN_COOKIE, "")
+    login_mode = bool(login_nonce) and verify_oauth_state(state, f"login:{login_nonce}")
+    user = None if login_mode else auth.optional_user(request, db)
+    if not login_mode and not user:
         return fail("Sign in first before connecting Google Drive")
     if error or not code:
         return fail(error or "Google Drive authorization was cancelled")
     if not drive_oauth_available():
         return fail("Google Drive OAuth is not configured on the server")
-    if not verify_oauth_state(state, user.id):
+    if not login_mode and not verify_oauth_state(state, user.id):
         return fail("Google Drive authorization expired; please try again")
     try:
         tokens = _exchange_code(code, resolve_redirect_uri(request))
         access_token = tokens.get("access_token", "")
         if not access_token:
             return fail("Google did not return an access token")
+        if login_mode:
+            user = _google_login_user(access_token, db)
         existing = db.get(UserGoogleDrive, user.id)
         refresh_token = tokens.get("refresh_token", "")
         refresh_enc = storage.encrypt_secret(refresh_token) if refresh_token else (existing.refresh_token_enc if existing else "")
@@ -648,7 +787,11 @@ def drive_callback(request: Request, code: str = "", state: str = "", error: str
                 )
             )
         db.commit()
-        return RedirectResponse("/?drive=connected", status_code=302)
+        response = RedirectResponse("/?drive=connected", status_code=302)
+        if login_mode:
+            auth.start_session(db, response, user)
+            response.delete_cookie(OAUTH_LOGIN_COOKIE, path="/", secure=auth.COOKIE_SECURE, httponly=True, samesite="lax")
+        return response
     except StoreError as err:
         return fail(err.message)
 

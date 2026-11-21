@@ -731,6 +731,38 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
         s, _, _ = await anon.request("GET", f"/s/{exp_token}")
         self.assertEqual(s, 404)
 
+        for pname in ("Zebra", "Alpha", "Middle"):
+            s, _, _ = await alice.request("POST", "/api/page", {"section": "Work/Notes", "name": pname, "html": f"<p>{pname}</p>"})
+            self.assertEqual(s, 200)
+        s, _, _ = await alice.request("POST", "/api/folder", {"parent": "", "name": "SecondNB"})
+        self.assertEqual(s, 200)
+
+        s, _, tree = await alice.request("GET", "/api/tree")
+        self.assertEqual(s, 200)
+        self.assertEqual([n["name"] for n in tree], ["Work", "SecondNB"])
+        self.assertEqual([p["name"] for p in tree[0]["sections"][0]["pages"]], ["Published", "Zebra", "Alpha", "Middle"])
+
+        s, _, _ = await alice.request("POST", "/api/rename", {"path": "Work/Notes/Zebra.html", "name": "Beta"})
+        self.assertEqual(s, 200)
+        s, _, tree = await alice.request("GET", "/api/tree")
+        self.assertEqual([p["name"] for p in tree[0]["sections"][0]["pages"]], ["Published", "Beta", "Alpha", "Middle"])
+
+        s, _, _ = await alice.request(
+            "POST",
+            "/api/reorder",
+            {
+                "kind": "pages",
+                "parent": "Work/Notes",
+                "items": ["Work/Notes/Middle.html", "Work/Notes/Alpha.html", "Work/Notes/Beta.html", "Work/Notes/Published.html"],
+            },
+        )
+        self.assertEqual(s, 200)
+        s, _, _ = await alice.request("POST", "/api/reorder", {"kind": "notebooks", "parent": "", "items": ["SecondNB", "Work"]})
+        self.assertEqual(s, 200)
+        s, _, tree = await alice.request("GET", "/api/tree")
+        self.assertEqual([n["name"] for n in tree], ["SecondNB", "Work"])
+        self.assertEqual([p["name"] for p in tree[1]["sections"][0]["pages"]], ["Middle", "Alpha", "Beta", "Published"])
+
     async def test_google_drive_oauth_and_crud_and_provider_switch(self):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         import re
@@ -778,7 +810,7 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
                 u = urlsplit(self.path)
                 qs = parse_qs(u.query, keep_blank_values=True)
                 if u.path == "/oauth/userinfo":
-                    self._send_json(200, {"email": "writer@gmail.com"})
+                    self._send_json(200, {"email": "writer@gmail.com", "verified_email": True})
                     return
                 if u.path == "/drive/v3/files":
                     q = qs.get("q", [""])[0]
@@ -1010,10 +1042,39 @@ class HtmlNoteApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(s, 200)
             self.assertEqual(d_tree[0]["sections"][0]["pages"][0]["name"], "Final")
 
+            for pname in ("Zebra", "Alpha"):
+                s, _, _ = await user.request("POST", "/api/page", {"section": "DriveNB/Ideas", "name": pname, "html": f"<p>{pname}</p>"})
+                self.assertEqual(s, 200)
+            s, _, d_tree = await user.request("GET", "/api/tree")
+            self.assertEqual([p["name"] for p in d_tree[0]["sections"][0]["pages"]], ["Final", "Zebra", "Alpha"])
+            s, _, _ = await user.request(
+                "POST",
+                "/api/reorder",
+                {"kind": "pages", "parent": "DriveNB/Ideas", "items": ["Alpha.html", "Final.html", "Zebra.html"]},
+            )
+            self.assertEqual(s, 200)
+            s, _, d_tree = await user.request("GET", "/api/tree")
+            self.assertEqual([p["name"] for p in d_tree[0]["sections"][0]["pages"]], ["Alpha", "Final", "Zebra"])
+
             s, _, cfg = await user.request("DELETE", "/api/drive")
             self.assertEqual(s, 200)
             self.assertFalse(cfg["driveConnected"])
             self.assertEqual(cfg["mode"], "custom")
+
+            guest = AsgiClient(app)
+            await guest.request("GET", "/api/auth/me")
+            s, hdrs, _ = await guest.request("GET", "/api/drive/login")
+            self.assertEqual(s, 302)
+            login_state = parse_qs(urlsplit(hdrs["location"]).query)["state"][0]
+            s, hdrs, _ = await AsgiClient(app).request("GET", f"/api/drive/callback?code=mycode&state={login_state}")
+            self.assertEqual(s, 302)
+            self.assertIn("drive_error", hdrs.get("location", ""))
+            s, hdrs, _ = await guest.request("GET", f"/api/drive/callback?code=mycode&state={login_state}")
+            self.assertEqual((s, hdrs.get("location")), (302, "/?drive=connected"))
+            s, _, me = await guest.request("GET", "/api/auth/me")
+            self.assertEqual(me["user"]["email"], "writer@gmail.com")
+            s, _, cfg = await guest.request("GET", "/api/storage")
+            self.assertEqual((cfg["mode"], cfg["driveEmail"]), ("gdrive", "writer@gmail.com"))
         finally:
             gserver.shutdown()
             gserver.server_close()

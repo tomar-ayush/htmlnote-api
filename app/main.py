@@ -99,6 +99,12 @@ class RenameIn(BaseModel):
     name: str
 
 
+class ReorderIn(BaseModel):
+    kind: str
+    parent: str = ""
+    items: list[str]
+
+
 @app.get("/healthz")
 def health():
     return {"ok": True}
@@ -134,6 +140,11 @@ def rename(
     res = store.rename(body.path, body.name)
     share.sync_renamed_shares(user.id, body.path, res["path"], db)
     return res
+
+
+@app.post("/api/reorder")
+def reorder(body: ReorderIn, store: Store = Depends(user_store)):
+    return store.reorder(body.kind, body.parent, body.items)
 
 
 @app.delete("/api/item")

@@ -2,6 +2,7 @@ from collections import OrderedDict
 import hashlib
 from html import escape as html_escape
 import ipaddress
+import json
 import os
 import re
 import socket
@@ -44,6 +45,145 @@ def sync_html_title(raw_html: str, title: str) -> str:
     if m:
         return raw_html[: m.end()] + f"<head>{tag}</head>\n" + raw_html[m.end() :]
     return f"<head>{tag}</head>\n{raw_html}"
+
+
+def empty_order() -> dict:
+    return {"notebooks": [], "sections": {}, "pages": {}}
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def parse_order(raw: str) -> dict:
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return empty_order()
+    if not isinstance(data, dict):
+        return empty_order()
+    nbs = _dedupe([str(x) for x in data.get("notebooks", []) if isinstance(x, str)])
+    secs_raw = data.get("sections", {})
+    secs = (
+        {str(k): _dedupe([str(x) for x in v if isinstance(x, str)]) for k, v in secs_raw.items() if isinstance(v, list)}
+        if isinstance(secs_raw, dict)
+        else {}
+    )
+    pages_raw = data.get("pages", {})
+    pages = (
+        {str(k): _dedupe([str(x) for x in v if isinstance(x, str)]) for k, v in pages_raw.items() if isinstance(v, list)}
+        if isinstance(pages_raw, dict)
+        else {}
+    )
+    return {"notebooks": nbs, "sections": secs, "pages": pages}
+
+
+def apply_order(items: list, key_fn, preferred: list[str], fallback_key) -> list:
+    if not preferred:
+        return sorted(items, key=fallback_key)
+    rank = {name: idx for idx, name in enumerate(preferred)}
+    known = sorted((item for item in items if key_fn(item) in rank), key=lambda item: rank[key_fn(item)])
+    rest = sorted((item for item in items if key_fn(item) not in rank), key=fallback_key)
+    return [*known, *rest]
+
+
+def order_append_folder(order: dict, parent_parts: list[str], leaf: str) -> dict:
+    if not parent_parts:
+        if leaf not in order["notebooks"]:
+            order["notebooks"].append(leaf)
+    elif len(parent_parts) == 1:
+        sec_list = order["sections"].setdefault(parent_parts[0], [])
+        if leaf not in sec_list:
+            sec_list.append(leaf)
+    return order
+
+
+def order_append_page(order: dict, sec_rel: str, filename: str) -> dict:
+    page_list = order["pages"].setdefault(sec_rel, [])
+    if filename not in page_list:
+        page_list.append(filename)
+    return order
+
+
+def order_rename(order: dict, src_parts: list[str], new_leaf: str) -> dict:
+    if len(src_parts) == 1:
+        old_nb = src_parts[0]
+        order["notebooks"] = _dedupe([new_leaf if x == old_nb else x for x in order["notebooks"]])
+        if old_nb in order["sections"]:
+            order["sections"][new_leaf] = order["sections"].pop(old_nb)
+        old_prefix = f"{old_nb}/"
+        for k in [key for key in order["pages"] if key.startswith(old_prefix)]:
+            order["pages"][f"{new_leaf}/{k[len(old_prefix):]}"] = order["pages"].pop(k)
+    elif len(src_parts) == 2:
+        nb, old_sec = src_parts
+        if nb in order["sections"]:
+            order["sections"][nb] = _dedupe([new_leaf if x == old_sec else x for x in order["sections"][nb]])
+        old_sec_key = f"{nb}/{old_sec}"
+        if old_sec_key in order["pages"]:
+            order["pages"][f"{nb}/{new_leaf}"] = order["pages"].pop(old_sec_key)
+    elif len(src_parts) == 3:
+        nb, sec, old_file = src_parts
+        sec_key = f"{nb}/{sec}"
+        if sec_key in order["pages"]:
+            order["pages"][sec_key] = _dedupe([new_leaf if x == old_file else x for x in order["pages"][sec_key]])
+    return order
+
+
+def order_remove(order: dict, src_parts: list[str]) -> dict:
+    if len(src_parts) == 1:
+        nb = src_parts[0]
+        order["notebooks"] = [x for x in order["notebooks"] if x != nb]
+        order["sections"].pop(nb, None)
+        prefix = f"{nb}/"
+        for k in [key for key in order["pages"] if key.startswith(prefix)]:
+            order["pages"].pop(k, None)
+    elif len(src_parts) == 2:
+        nb, sec = src_parts
+        if nb in order["sections"]:
+            order["sections"][nb] = [x for x in order["sections"][nb] if x != sec]
+        order["pages"].pop(f"{nb}/{sec}", None)
+    elif len(src_parts) == 3:
+        nb, sec, filename = src_parts
+        sec_key = f"{nb}/{sec}"
+        if sec_key in order["pages"]:
+            order["pages"][sec_key] = [x for x in order["pages"][sec_key] if x != filename]
+    return order
+
+
+def order_set(order: dict, kind: str, parent: str, items: list[str], split_rel_fn) -> dict:
+    if kind == "notebooks":
+        if split_rel_fn(parent):
+            raise StoreError(400, "Invalid parent")
+        leaves = [parts[-1] for parts in (split_rel_fn(x) for x in items) if parts]
+        order["notebooks"] = _dedupe(leaves)
+        return order
+    if kind == "sections":
+        pp = split_rel_fn(parent)
+        if len(pp) != 1:
+            raise StoreError(400, "Invalid parent")
+        leaves = [parts[-1] for parts in (split_rel_fn(x) for x in items) if parts]
+        order["sections"][pp[0]] = _dedupe(leaves)
+        return order
+    if kind == "pages":
+        pp = split_rel_fn(parent)
+        if len(pp) != 2:
+            raise StoreError(400, "Invalid parent")
+        leaves = []
+        for x in items:
+            parts = split_rel_fn(x)
+            if not parts:
+                continue
+            leaf = parts[-1]
+            leaves.append(leaf if PAGE_EXT.search(leaf) else f"{leaf}.html")
+        order["pages"][f"{pp[0]}/{pp[1]}"] = _dedupe(leaves)
+        return order
+    raise StoreError(400, "Invalid reorder target")
 
 _CACHE_LOCK = threading.Lock()
 _ENDPOINT_CACHE: OrderedDict[tuple[str, bool], str] = OrderedDict()
@@ -357,6 +497,21 @@ class Store:
         self._call(self.client.put_object, Bucket=self.bucket, Key=probe, Body=b"ok", ContentType="text/plain")
         self._call(self.client.delete_object, Bucket=self.bucket, Key=probe)
 
+    def _read_order(self) -> dict:
+        try:
+            return parse_order(self._get_text(self.full_key(".order.json")))
+        except FileNotFoundError:
+            return empty_order()
+
+    def _write_order(self, order: dict) -> None:
+        self._call(
+            self.client.put_object,
+            Bucket=self.bucket,
+            Key=self.full_key(".order.json"),
+            Body=json.dumps(order, separators=(",", ":")).encode("utf-8"),
+            ContentType="application/json; charset=utf-8",
+        )
+
     def tree(self) -> list[dict]:
         notebooks_map: dict[str, set[str]] = {}
         pages_map: dict[tuple[str, str], list[dict]] = {}
@@ -364,6 +519,8 @@ class Store:
         nb_min_ts: dict[str, float] = {}
         sec_keep_ts: dict[tuple[str, str], float] = {}
         sec_min_ts: dict[tuple[str, str], float] = {}
+        page_min_ts: dict[tuple[str, str, str], float] = {}
+        has_order = False
 
         def ensure_nb(nb: str, ts: float) -> None:
             notebooks_map.setdefault(nb, set())
@@ -384,6 +541,9 @@ class Store:
                 continue
             lm = obj.get("LastModified")
             ts = lm.timestamp() if lm else 0.0
+            if rel == ".order.json":
+                has_order = True
+                continue
             if rel.endswith("/"):
                 parts = [p for p in rel.split("/") if p]
                 if not parts or any(p.startswith(".") for p in parts):
@@ -394,6 +554,12 @@ class Store:
                     ensure_sec(parts[0], parts[1], ts)
                 continue
             parts = rel.split("/")
+            if parts[0] == ".versions" and len(parts) == 5 and VERSION_ID.match(parts[4]):
+                vts = int(parts[4].split(".")[0]) / 1000.0
+                pkey = (parts[1], parts[2], parts[3])
+                if pkey not in page_min_ts or vts < page_min_ts[pkey]:
+                    page_min_ts[pkey] = vts
+                continue
             if parts[0].startswith("."):
                 continue
             if len(parts) == 2 and parts[1] == ".keep":
@@ -404,18 +570,37 @@ class Store:
                 sec_keep_ts[(parts[0], parts[1])] = ts
             elif len(parts) == 3 and not any(p.startswith(".") for p in parts) and PAGE_EXT.search(parts[2]):
                 ensure_sec(parts[0], parts[1], ts)
-                pages_map[(parts[0], parts[1])].append({"name": PAGE_EXT.sub("", parts[2]), "path": rel})
+                pkey = (parts[0], parts[1], parts[2])
+                if pkey not in page_min_ts or ts < page_min_ts[pkey]:
+                    page_min_ts[pkey] = ts
+                pages_map[(parts[0], parts[1])].append(
+                    {"name": PAGE_EXT.sub("", parts[2]), "path": rel, "leaf": parts[2]}
+                )
 
-        ordered_nbs = sorted(notebooks_map.keys(), key=lambda n: (nb_keep_ts.get(n, nb_min_ts.get(n, 0.0)), n.lower()))
+        order = self._read_order() if has_order else empty_order()
+        ordered_nbs = apply_order(
+            list(notebooks_map.keys()),
+            lambda n: n,
+            order["notebooks"],
+            lambda n: (nb_keep_ts.get(n, nb_min_ts.get(n, 0.0)), n.lower()),
+        )
         result = []
         for nb in ordered_nbs:
-            ordered_secs = sorted(
-                notebooks_map[nb],
-                key=lambda s: (sec_keep_ts.get((nb, s), sec_min_ts.get((nb, s), 0.0)), s.lower()),
+            ordered_secs = apply_order(
+                list(notebooks_map[nb]),
+                lambda s: s,
+                order["sections"].get(nb, []),
+                lambda s: (sec_keep_ts.get((nb, s), sec_min_ts.get((nb, s), 0.0)), s.lower()),
             )
             sections = []
             for sec in ordered_secs:
-                pages = sorted(pages_map[(nb, sec)], key=lambda p: p["name"].lower())
+                ordered_pages = apply_order(
+                    pages_map[(nb, sec)],
+                    lambda p: p["leaf"],
+                    order["pages"].get(f"{nb}/{sec}", []),
+                    lambda p: (page_min_ts.get((nb, sec, p["leaf"]), 0.0), p["name"].lower()),
+                )
+                pages = [{"name": p["name"], "path": p["path"]} for p in ordered_pages]
                 sections.append({"name": sec, "path": f"{nb}/{sec}", "pages": pages})
             result.append({"name": nb, "path": nb, "sections": sections})
         return result
@@ -436,6 +621,9 @@ class Store:
             i += 1
         rel = f"{parent_rel}{candidate}"
         self._put_keep(rel)
+        order = self._read_order()
+        order_append_folder(order, parts, candidate)
+        self._write_order(order)
         return {"path": rel}
 
     def create_page(self, section: str, name: str, html: str) -> dict:
@@ -462,6 +650,9 @@ class Store:
         self._check_quota(added)
         self._put_text(self.full_key(rel), content)
         self._adjust_usage(added)
+        order = self._read_order()
+        order_append_page(order, sec_rel, filename)
+        self._write_order(order)
         return {"path": rel}
 
     def page_exists(self, rel: str) -> bool:
@@ -574,13 +765,17 @@ class Store:
             self._delete_keys([src_key, *(o["Key"] for o in ver_objs)])
             self._adjust_usage(new_len - old_len)
             _evict_snapshot(self.endpoint_url, self.bucket, src_key)
+            order = self._read_order()
+            order_rename(order, parts, f"{new_stem}.html")
+            self._write_order(order)
             return {"path": dst_rel}
         if len(parts) not in (1, 2):
             raise StoreError(400, "Invalid path")
         old_objs = self._list(f"{src_rel}/")
         if not old_objs:
             raise FileNotFoundError()
-        dst_rel = "/".join([*parts[:-1], self.clean_name(name)])
+        new_leaf = self.clean_name(name)
+        dst_rel = "/".join([*parts[:-1], new_leaf])
         if dst_rel == src_rel:
             return {"path": src_rel}
         if self._list_one(f"{dst_rel}/"):
@@ -596,6 +791,9 @@ class Store:
             self._copy_key(obj["Key"], new_ver_prefix + obj["Key"][len(old_ver_prefix) :])
         self._delete_keys([*(o["Key"] for o in old_objs), *(o["Key"] for o in ver_objs)])
         _evict_snapshot(self.endpoint_url, self.bucket, old_prefix, is_prefix=True)
+        order = self._read_order()
+        order_rename(order, parts, new_leaf)
+        self._write_order(order)
         return {"path": dst_rel}
 
     def remove(self, rel: str) -> dict:
@@ -614,6 +812,9 @@ class Store:
             sec_rel = f"{parts[0]}/{parts[1]}"
             if not self._list_one(f"{sec_rel}/"):
                 self._put_keep(sec_rel)
+            order = self._read_order()
+            order_remove(order, parts)
+            self._write_order(order)
             return {"removed": True}
         if len(parts) not in (1, 2):
             raise StoreError(400, "Invalid path")
@@ -626,4 +827,13 @@ class Store:
         self._invalidate_usage()
         if len(parts) == 2 and not self._list_one(f"{parts[0]}/"):
             self._put_keep(parts[0])
+        order = self._read_order()
+        order_remove(order, parts)
+        self._write_order(order)
         return {"removed": True}
+
+    def reorder(self, kind: str, parent: str, items: list[str]) -> dict:
+        order = self._read_order()
+        order_set(order, kind, parent, items, self.split_rel)
+        self._write_order(order)
+        return {"ok": True}
